@@ -1,0 +1,2055 @@
+// gameEngine.js
+//
+// Чистые правила игры «Точки» — без canvas, без DOM, без localStorage.
+// Тот же модуль подключается и в браузере (через <script>, кладёт себя
+// в window.TochkiEngine), и в Node.js на сервере (через require/import) —
+// поэтому сервер и клиент физически не могут разойтись в трактовке правил:
+// это один и тот же код, а не две параллельные реализации.
+//
+// Публичный API:
+//   TochkiEngine.SIZES / DIFFICULTY / BOT_WEIGHTS / BOT_PLAYER
+//   TochkiEngine.getOpeningZone(rows, cols)
+//   TochkiEngine.createMatch(options) -> объект партии с методами
+//     applyMove(player, x, y), botMove(difficultyKey, weights),
+//     endNow(), getSnapshot(), getMoveLog()
+//
+// createMatch — это как раз то, чего не хватало в однопользовательской
+// версии: там правила жили в module-level переменных (let rows, cols, stone...),
+// что нормально для одной партии в одной вкладке, но не подходит для сервера,
+// которому нужно параллельно вести много независимых комнат. Здесь состояние
+// партии — обычный объект в замыкании фабрики, поэтому createMatch можно
+// вызывать сколько угодно раз с независимым состоянием на каждую комнату.
+
+(function (root, factory) {
+  if (typeof module === 'object' && module.exports) {
+    module.exports = factory();
+  } else {
+    root.TochkiEngine = factory();
+  }
+})(typeof self !== 'undefined' ? self : this, function () {
+  'use strict';
+
+  // Кросс-окруженческий высокоточный таймер: в браузере — performance.now(),
+  // в Node (>=16) он тоже есть глобально, но на всякий случай подстрахуемся.
+  const now = (typeof performance !== 'undefined' && performance.now)
+    ? () => performance.now()
+    : () => Date.now();
+
+  const SIZES = {
+    small:  { cols: 12, rows: 10  },
+    medium: { cols: 16, rows: 12 },
+    large:  { cols: 22, rows: 16 }
+  };
+
+  const DIFFICULTY = {
+    normal: { radius:2, candidateCap:10, timeLimit:220, maxDepth:3, branchWide:5, branchMid:4, branchNarrow:3, quiescenceExt:2, safety2:false, safety2Top:5 },
+    strong: { radius:4, candidateCap:20, timeLimit:2000, maxDepth:6, branchWide:8, branchMid:6, branchNarrow:5, quiescenceExt:3, safety2:true, safety2Top:8, antiFork:false, antiForkTop:2, antiForkCap:150 }
+  };
+  // safety2 (issue #52) — корневой фильтр угрозы «сети» за 2 хода соперника,
+  // см. twoMoveThreat/applySafety2. antiFork — анти-вилка на 4 полухода
+  // (forkLoss/forkLoss4/applyAntiFork). По умолчанию выключены (issue #55),
+  // кроме safety2 в strong: абляция S8 (#62, docs/S8_RESULTS.md) дала на 20
+  // парах против базы долю 0.688, ci95 [0.563, 0.813] (lo > 0.5) — включён
+  // с версии бота tochki-ab-2. В normal safety2 не проверялся и выключен,
+  // antiFork выключен. Монитор (monitor:false) по S8 хуже базы — не включаем.
+  // TRAIN_DIFF их тоже не включает.
+  const TRAIN_DIFF = { radius:3, candidateCap:16, timeLimit:700, maxDepth:4, branchWide:6, branchMid:6, branchNarrow:4, quiescenceExt:3 };
+
+  const BOT_PLAYER = 2;
+  // liberty — вес нового термина «безопасность групп» (см. computeGroupLiberties
+  // / libertyRisk ниже). Без него бот видел опасность окружения только когда
+  // захват уже случился внутри горизонта поиска; с ним — на любой глубине,
+  // потому что риск считается прямо в статической оценке листа.
+  // Значения по умолчанию подобраны вручную и являются стартовой точкой для
+  // tools/train-bot.js — самообучение self-play подбирает их точнее.
+  const BOT_WEIGHTS = { potential: 6, cohesion: 1.2, stones: 0.15, liberty: 5 };
+  const CAPTURED_WEIGHT = 100;
+  const DIRS4 = [[1,0],[-1,0],[0,1],[0,-1]];
+
+  // ---------- Дебютная зона ----------
+  const OPENING_ZONE_SIDE = 4;
+  function getOpeningZone(rows, cols){
+    const cx = Math.floor(cols/2), cy = Math.floor(rows/2);
+    const half = Math.floor(OPENING_ZONE_SIDE/2);
+    let minX = cx - half, minY = cy - half;
+    let maxX = minX + OPENING_ZONE_SIDE - 1, maxY = minY + OPENING_ZONE_SIDE - 1;
+    minX = Math.max(0, minX); minY = Math.max(0, minY);
+    maxX = Math.min(cols-1, maxX); maxY = Math.min(rows-1, maxY);
+    return {minX, minY, maxX, maxY};
+  }
+  function inZone(x, y, zone){
+    return x>=zone.minX && x<=zone.maxX && y>=zone.minY && y<=zone.maxY;
+  }
+
+  // ---------- Стартовая позиция (issue #47) ----------
+  // START_POSITIONS — допустимые значения настройки партии startPosition.
+  // getStartStones возвращает точки, которые стоят на поле до первого хода:
+  // для 'cross' — квадрат 2×2 в центре поля (внутри дебютной зоны),
+  // расположенный крестом: (cx-1,cy-1)=1, (cx,cy-1)=2, (cx-1,cy)=2, (cx,cy)=1.
+  const START_POSITIONS = ['empty', 'cross'];
+  function getStartStones(startPosition, rows, cols){
+    if (startPosition !== 'cross') return [];
+    const cx = Math.floor(cols/2), cy = Math.floor(rows/2);
+    return [
+      { x: cx-1, y: cy-1, p: 1 }, { x: cx, y: cy-1, p: 2 },
+      { x: cx-1, y: cy,   p: 2 }, { x: cx, y: cy,   p: 1 }
+    ];
+  }
+
+  function createEmptyState(rows, cols){
+    return {
+      stone: Array.from({length:rows}, () => new Array(cols).fill(0)),
+      dead: Array.from({length:rows}, () => new Array(cols).fill(0)),
+      territory: Array.from({length:rows}, () => new Array(cols).fill(0))
+    };
+  }
+
+  function cloneState(state){
+    return {
+      stone: state.stone.map(r => r.slice()),
+      dead: state.dead.map(r => r.slice()),
+      territory: state.territory.map(r => r.slice())
+    };
+  }
+
+  function cellOwner(state, x, y){
+    const { stone, dead, territory } = state;
+    if (dead[y][x] !== 0) return dead[y][x];
+    if (territory[y][x] !== 0) return territory[y][x];
+    if (stone[y][x] !== 0) return stone[y][x];
+    return 0;
+  }
+
+  // Клетка — «стена» игрока player, только если это его живая точка либо
+  // клетка уже под его контролем (прежде захваченная точка / территория).
+  function isWall(state, x, y, player){
+    const { stone, dead, territory } = state;
+    if (dead[y][x] === player) return true;
+    if (territory[y][x] === player) return true;
+    if (stone[y][x] === player && dead[y][x] === 0) return true;
+    return false;
+  }
+
+  // Захват: заливкой ищем связные области, не являющиеся стеной player,
+  // не касающиеся края поля и содержащие хотя бы одну живую точку соперника.
+  // Мутирует state.dead/state.territory. Возвращает список изменённых клеток.
+  function runCaptures(state, player, rows, cols){
+    const { stone, dead, territory } = state;
+    const opponent = player === 1 ? 2 : 1;
+    // B04 (issue #27): профиль показал runCaptures главным bottleneck
+    // (~33% CPU + GC от аллокаций [x,y]-пар и массива направлений на каждую
+    // клетку). Заливка переписана на плоские типизированные массивы БЕЗ
+    // изменения семантики: тот же порядок обхода (соседи +x, -x, +y, -y,
+    // стек LIFO), поэтому и состояние, и порядок gained идентичны прежним.
+    const n = rows * cols;
+    const visited = new Uint8Array(n);
+    const stack = new Int32Array(n);  // каждая клетка кладётся не более раза
+    const region = new Int32Array(n);
+    const gained = [];
+    const wall = (wx, wy) => {
+      const d = dead[wy][wx];
+      return d === player || territory[wy][wx] === player || (d === 0 && stone[wy][wx] === player);
+    };
+
+    for (let y=0; y<rows; y++){
+      for (let x=0; x<cols; x++){
+        const i0 = y*cols + x;
+        if (visited[i0]) continue;
+        visited[i0] = 1;
+        if (wall(x, y)) continue;
+        let sp = 0, rn = 0;
+        stack[sp++] = i0;
+        let touchesBorder = false;
+        let containsLiveOpponent = false;
+        while (sp > 0){
+          const ci = stack[--sp];
+          const cy = (ci / cols) | 0, cx = ci - cy*cols;
+          region[rn++] = ci;
+          if (cx===0 || cy===0 || cx===cols-1 || cy===rows-1) touchesBorder = true;
+          if (stone[cy][cx] === opponent && dead[cy][cx] === 0) containsLiveOpponent = true;
+          if (cx+1 < cols && !visited[ci+1]){ visited[ci+1] = 1; if (!wall(cx+1, cy)) stack[sp++] = ci+1; }
+          if (cx-1 >= 0 && !visited[ci-1]){ visited[ci-1] = 1; if (!wall(cx-1, cy)) stack[sp++] = ci-1; }
+          if (cy+1 < rows && !visited[ci+cols]){ visited[ci+cols] = 1; if (!wall(cx, cy+1)) stack[sp++] = ci+cols; }
+          if (cy-1 >= 0 && !visited[ci-cols]){ visited[ci-cols] = 1; if (!wall(cx, cy-1)) stack[sp++] = ci-cols; }
+        }
+        if (!touchesBorder && containsLiveOpponent){
+          for (let k=0; k<rn; k++){
+            const cy = (region[k] / cols) | 0, cx = region[k] - cy*cols;
+            if (stone[cy][cx] === player){
+              // Классическое освобождение: своя ранее пленённая точка внутри
+              // нового контура снова живая (dead = 0); очков за неё никто
+              // не получает, противник теряет очко (см. computeScores).
+              if (dead[cy][cx] !== 0){
+                gained.push({x:cx, y:cy, prevOwner: dead[cy][cx], kind:'freed'});
+                dead[cy][cx] = 0;
+              }
+            } else if (stone[cy][cx] !== 0){
+              // Точка противника (живая или его ранее «отбитая») — пленена.
+              if (dead[cy][cx] !== player){
+                gained.push({x:cx, y:cy, prevOwner: dead[cy][cx], kind:'captured'});
+                dead[cy][cx] = player;
+              }
+            } else if (territory[cy][cx] !== player){
+              // Пустая клетка внутри контура: отмечается владельцем окружения,
+              // но очков НЕ даёт (классические правила).
+              gained.push({x:cx, y:cy, prevOwner: territory[cy][cx], kind:'territory'});
+              territory[cy][cx] = player;
+            }
+          }
+        }
+      }
+    }
+    return gained;
+  }
+
+  // Классический счёт: очко даёт только пленённая точка противника
+  // (stone = цвет противника, dead = владелец окружения). Пустые клетки и
+  // свои точки внутри контура очков не дают. Счёт всегда выводится из
+  // состояния доски, поэтому освобождение/перезахват корректны автоматически.
+  function computeScores(state, rows, cols){
+    const scores = {1:0, 2:0};
+    for (let y=0; y<rows; y++)
+      for (let x=0; x<cols; x++){
+        const s = state.stone[y][x], d = state.dead[y][x];
+        if (s !== 0 && d !== 0 && d !== s) scores[d] += 1;
+      }
+    return scores;
+  }
+
+  function countCaptured(gained){
+    let n = 0;
+    for (const g of gained) if (g.kind === 'captured') n++;
+    return n;
+  }
+
+  // ---------- Бот ----------
+
+  function generateCandidates(state, rows, cols, radius){
+    const { stone, territory } = state;
+    const cand = new Set();
+    const has = (x,y) => stone[y][x] !== 0;
+    let anyStone = false;
+    let stoneCount = 0;
+    for (let y=0; y<rows; y++){
+      for (let x=0; x<cols; x++){
+        if (!has(x,y)) continue;
+        anyStone = true;
+        stoneCount++;
+        for (let dy=-radius; dy<=radius; dy++){
+          for (let dx=-radius; dx<=radius; dx++){
+            const nx=x+dx, ny=y+dy;
+            if (nx<0||ny<0||nx>=cols||ny>=rows) continue;
+            if (stone[ny][nx]!==0 || territory[ny][nx]!==0) continue;
+            cand.add(ny*cols+nx);
+          }
+        }
+      }
+    }
+    if (!anyStone){
+      cand.add(Math.floor(rows/2)*cols + Math.floor(cols/2));
+    }
+    let result = Array.from(cand).map(v => ({x: v % cols, y: Math.floor(v/cols)}));
+
+    if (stoneCount < 2){
+      const zone = getOpeningZone(rows, cols);
+      let restricted = result.filter(c => inZone(c.x, c.y, zone));
+      if (!restricted.length){
+        for (let y=zone.minY; y<=zone.maxY; y++){
+          for (let x=zone.minX; x<=zone.maxX; x++){
+            if (stone[y][x]===0 && territory[y][x]===0) restricted.push({x,y});
+          }
+        }
+      }
+      result = restricted;
+    }
+    return result;
+  }
+
+  function quickScore(state, rows, cols, x, y, player, urgentMap){
+    const { stone } = state;
+    const opponent = player === 1 ? 2 : 1;
+    let s = 0;
+    for (let dy=-2; dy<=2; dy++){
+      for (let dx=-2; dx<=2; dx++){
+        const nx=x+dx, ny=y+dy;
+        if (nx<0||ny<0||nx>=cols||ny>=rows) continue;
+        const dist = Math.max(Math.abs(dx),Math.abs(dy));
+        if (stone[ny][nx]===opponent) s += 3/dist;
+        else if (stone[ny][nx]===player) s += 2/dist;
+      }
+    }
+    const cx = cols/2, cy = rows/2;
+    s += 0.4 / (1 + Math.hypot(x-cx, y-cy));
+    // Бонус за срочность — см. computeUrgentCells. Без него кандидат-ордеринг
+    // и обрезка по candidateCap/branchFactor могли отбросить единственный
+    // ход, спасающий группу от захвата, ещё до того, как поиск успевал его
+    // увидеть — именно это и выглядело как «бот защищает обречённые точки».
+    if (urgentMap){
+      const bonus = urgentMap.get(y*cols+x);
+      if (bonus) s += bonus;
+    }
+    return s;
+  }
+
+  function computeTerritoryPotential(state, rows, cols){
+    const { stone, territory } = state;
+    const visited = Array.from({length: rows}, () => new Array(cols).fill(false));
+    const potential = {1:0, 2:0};
+    for (let y=0; y<rows; y++){
+      for (let x=0; x<cols; x++){
+        if (visited[y][x]) continue;
+        if (stone[y][x] !== 0 || territory[y][x] !== 0){ visited[y][x] = true; continue; }
+        const stack = [[x,y]];
+        visited[y][x] = true;
+        let regionSize = 0;
+        let touchesBorder = false;
+        const owners = new Set();
+        while (stack.length){
+          const [cx,cy] = stack.pop();
+          regionSize++;
+          if (cx===0 || cy===0 || cx===cols-1 || cy===rows-1) touchesBorder = true;
+          for (const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1]]){
+            const nx=cx+dx, ny=cy+dy;
+            if (nx<0||ny<0||nx>=cols||ny>=rows) continue;
+            const neutral = stone[ny][nx]===0 && territory[ny][nx]===0;
+            if (neutral){
+              if (!visited[ny][nx]){ visited[ny][nx] = true; stack.push([nx,ny]); }
+            } else {
+              const owner = cellOwner(state, nx, ny);
+              if (owner !== 0) owners.add(owner);
+            }
+          }
+        }
+        if (!touchesBorder && owners.size === 1){
+          potential[[...owners][0]] += regionSize;
+        }
+      }
+    }
+    return potential;
+  }
+
+  // ---------- Свободы групп («атари») ----------
+  //
+  // computeTerritoryPotential выше отвечает на вопрос «какая пустая область
+  // уже полностью замкнута одним игроком» — это факт, наступающий постфактум,
+  // ровно в момент захвата. Он ничего не говорит о том, что группа живых
+  // камней постепенно ЛИШАЕТСЯ путей наружу за несколько ходов до захвата —
+  // а именно это нужно боту, чтобы вовремя защищаться и вовремя окружать
+  // самому. Здесь используется АНАЛОГИЯ со «свободами» (liberties) в го:
+  // для связной группы живых камней игрока считаются соседние пустые клетки.
+  // ВАЖНО (A09, #14): это лишь проверяемая эвристика, а не правило захвата.
+  // runCaptures захватывает область, если путь к краю перекрыт стенами
+  // захватчика, — число соседних пустот этого не определяет. Группа с 1-2
+  // «свободами» у края часто вообще не может быть захвачена, а группа с
+  // многими «свободами» может быть уже обречена. Признак, согласованный с
+  // реальным критерием захвата, — computeEdgeEscape ниже (по умолчанию выкл.).
+  function computeGroupLiberties(state, rows, cols, player){
+    const { stone, dead, territory } = state;
+    const visited = Array.from({length: rows}, () => new Array(cols).fill(false));
+    const groups = [];
+    for (let y=0; y<rows; y++){
+      for (let x=0; x<cols; x++){
+        if (visited[y][x]) continue;
+        if (!(stone[y][x] === player && dead[y][x] === 0)){ visited[y][x] = true; continue; }
+        const stack = [[x,y]];
+        visited[y][x] = true;
+        const cells = [];
+        const libs = new Set();
+        while (stack.length){
+          const [cx,cy] = stack.pop();
+          cells.push([cx,cy]);
+          for (const [dx,dy] of DIRS4){
+            const nx=cx+dx, ny=cy+dy;
+            if (nx<0||ny<0||nx>=cols||ny>=rows) continue;
+            if (stone[ny][nx] === player && dead[ny][nx] === 0){
+              if (!visited[ny][nx]){ visited[ny][nx] = true; stack.push([nx,ny]); }
+            } else if (stone[ny][nx] === 0 && dead[ny][nx] === 0 && territory[ny][nx] === 0){
+              libs.add(ny*cols+nx);
+            }
+          }
+        }
+        groups.push({ cells, size: cells.length, liberties: libs.size, libCells: libs });
+      }
+    }
+    return groups;
+  }
+
+  // Риск группы растёт резко нелинейно по мере приближения к «атари»
+  // (1 свобода — следующий ход соперника захватывает группу целиком).
+  // Множитель на size означает, что потеря большой сцепленной группы —
+  // катастрофа, а не мелкая потеря одного камня.
+  function libertyRisk(groups){
+    let risk = 0;
+    for (const g of groups){
+      if (g.liberties <= 1) risk += g.size * 6;
+      else if (g.liberties === 2) risk += g.size * 2.5;
+      else if (g.liberties === 3) risk += g.size * 0.8;
+    }
+    return risk;
+  }
+
+  function hasUrgentAtari(state, rows, cols, player){
+    const opponent = player === 1 ? 2 : 1;
+    const mine = computeGroupLiberties(state, rows, cols, player);
+    if (mine.some(g => g.liberties <= 1)) return true;
+    const theirs = computeGroupLiberties(state, rows, cols, opponent);
+    if (theirs.some(g => g.liberties <= 1)) return true;
+    return false;
+  }
+
+  // Клетки-«свободы» групп в атари (liberties<=2) для обеих сторон,
+  // с бонусом для quickScore/сортировки кандидатов — чтобы срочный ход
+  // (спасти свою группу или добить чужую) не вылетел из top-N кандидатов
+  // при обрезке по candidateCap/branchFactor до того, как поиск вообще
+  // успеет его увидеть.
+  function computeUrgentCells(state, rows, cols, mover){
+    const opponent = mover === 1 ? 2 : 1;
+    const urgent = new Map();
+    const mark = (groups, bonus) => {
+      for (const g of groups){
+        if (g.liberties > 2) continue;
+        const w = g.liberties <= 1 ? bonus * 2.2 : bonus * 1.1;
+        for (const key of g.libCells){
+          if ((urgent.get(key) || 0) < w) urgent.set(key, w);
+        }
+      }
+    };
+    mark(computeGroupLiberties(state, rows, cols, mover), 5);      // спасти свою группу
+    mark(computeGroupLiberties(state, rows, cols, opponent), 4.2); // добить чужую
+    return urgent;
+  }
+
+    // ---------- A09 (#14): связь области с краем относительно стен ----------
+  //
+  // В отличие от computeGroupLiberties (аналогия с го: «мало соседних пустот»
+  // ≠ гарантированный захват), здесь используется тот же критерий, что и в
+  // runCaptures: область из клеток, НЕ являющихся стеной атакующего player,
+  // захватывается только если она не касается края и содержит живую точку
+  // соперника. Признак = Σ по областям с живыми точками соперника, ещё
+  // связанным с краем: liveOpp / (1 + borderCells), где borderCells — число
+  // клеток области на краю («ширина выхода»). Узкий выход к краю => высокая
+  // ценность закрытия для player; широкий выход => почти ноль. Пустые
+  // области без соперника вклада не дают (они очков не приносят).
+  // Признак выключен по умолчанию (weights.edgeEscape отсутствует => 0 и
+  // даже не вычисляется), включается только для ablation/A07-сравнения.
+  function computeEdgeEscape(state, rows, cols, player){
+    const { stone, dead } = state;
+    const opponent = player === 1 ? 2 : 1;
+    const visited = Array.from({length: rows}, () => new Array(cols).fill(false));
+    let pressure = 0;
+    for (let y=0; y<rows; y++){
+      for (let x=0; x<cols; x++){
+        if (visited[y][x]) continue;
+        visited[y][x] = true;
+        if (isWall(state, x, y, player)) continue;
+        const stack = [[x,y]];
+        let liveOpp = 0, borderCells = 0;
+        while (stack.length){
+          const [cx,cy] = stack.pop();
+          if (cx===0 || cy===0 || cx===cols-1 || cy===rows-1) borderCells++;
+          if (stone[cy][cx] === opponent && dead[cy][cx] === 0) liveOpp++;
+          for (const [dx,dy] of DIRS4){
+            const nx=cx+dx, ny=cy+dy;
+            if (nx<0||ny<0||nx>=cols||ny>=rows) continue;
+            if (visited[ny][nx]) continue;
+            visited[ny][nx] = true;
+            if (isWall(state, nx, ny, player)) continue;
+            stack.push([nx,ny]);
+          }
+        }
+        if (liveOpp > 0 && borderCells > 0) pressure += liveOpp / (1 + borderCells);
+      }
+    }
+    return pressure;
+  }
+
+    // A09 шаг 2 (#14): стоимость закрытия/выхода, измеренная РЕАЛЬНЫМИ правилами.
+  // Для областей с живыми точками соперника, связанных с краем узким выходом
+  // (<= 2 клеток края), пробуем поставить точку player на каждую пустую клетку
+  // края области и запускаем runCaptures. Возвращает максимум пленённых точек
+  // одним ходом (0 — за 1 ход закрыть нельзя, т.е. «стоимость» > 1 хода).
+  // Для соперника то же значение — его угроза, т.е. «стоимость выхода» для нас.
+  // Ограничение: внутренние коридоры (не на краю) не проверяются.
+  function closeInOneThreat(state, rows, cols, player){
+    const { stone, dead, territory } = state;
+    const opponent = player === 1 ? 2 : 1;
+    const visited = Array.from({length: rows}, () => new Array(cols).fill(false));
+    const tried = new Set();
+    let best = 0;
+    for (let y=0; y<rows; y++){
+      for (let x=0; x<cols; x++){
+        if (visited[y][x]) continue;
+        visited[y][x] = true;
+        if (isWall(state, x, y, player)) continue;
+        const stack = [[x,y]];
+        let liveOpp = 0, borderCells = 0;
+        const borderEmpty = [];
+        while (stack.length){
+          const [cx,cy] = stack.pop();
+          if (cx===0 || cy===0 || cx===cols-1 || cy===rows-1){
+            borderCells++;
+            if (stone[cy][cx] === 0 && dead[cy][cx] === 0 && territory[cy][cx] === 0) borderEmpty.push(cy*cols+cx);
+          }
+          if (stone[cy][cx] === opponent && dead[cy][cx] === 0) liveOpp++;
+          for (const [dx,dy] of DIRS4){
+            const nx=cx+dx, ny=cy+dy;
+            if (nx<0||ny<0||nx>=cols||ny>=rows) continue;
+            if (visited[ny][nx]) continue;
+            visited[ny][nx] = true;
+            if (isWall(state, nx, ny, player)) continue;
+            stack.push([nx,ny]);
+          }
+        }
+        if (liveOpp === 0 || borderCells === 0 || borderCells > 2) continue;
+        for (const k of borderEmpty){
+          if (tried.has(k)) continue;
+          tried.add(k);
+          const s = cloneState(state);
+          s.stone[Math.floor(k/cols)][k%cols] = player;
+          const n = countCaptured(runCaptures(s, player, rows, cols));
+          if (n > best) best = n;
+        }
+      }
+    }
+    return best;
+  }
+
+  // ctx (необязательный, A09) — узел поиска: current (чей ход) и rules
+  // (targetScore/targetFillPercent). Нужен только признакам captureRace и
+  // endgameScore; без ctx они не действуют.
+  function evaluateStatic(state, rows, cols, forPlayer, weights, ctx){
+    const { stone, dead, territory } = state;
+    const opponent = forPlayer === 1 ? 2 : 1;
+    const captured = {1:0, 2:0};
+    const liveStones = {1:0, 2:0};
+    const cohesion = {1:0, 2:0};
+    for (let y=0; y<rows; y++){
+      for (let x=0; x<cols; x++){
+        if (dead[y][x] !== 0){ captured[dead[y][x]]++; continue; }
+        if (territory[y][x] !== 0){ captured[territory[y][x]]++; continue; }
+        const p = stone[y][x];
+        if (p !== 0){
+          liveStones[p]++;
+          if (x+1<cols && stone[y][x+1]===p && dead[y][x+1]===0) cohesion[p]++;
+          if (y+1<rows && stone[y+1][x]===p && dead[y+1][x]===0) cohesion[p]++;
+        }
+      }
+    }
+    const potential = computeTerritoryPotential(state, rows, cols);
+    const capturedDiff  = captured[forPlayer] - captured[opponent];
+    const potentialDiff = potential[forPlayer] - potential[opponent];
+    const cohesionDiff  = cohesion[forPlayer] - cohesion[opponent];
+    const stoneDiff     = liveStones[forPlayer] - liveStones[opponent];
+
+    // libertyDiff > 0, когда СОПЕРНИК ближе к потере группы, чем forPlayer —
+    // то есть положительно и за собственную оборону, и за давление на чужие
+    // группы. weights.liberty может отсутствовать у старых сохранённых
+    // весов (из БД/прежних версий) — тогда просто не влияет на оценку.
+    const ownGroups = computeGroupLiberties(state, rows, cols, forPlayer);
+    const oppGroups = computeGroupLiberties(state, rows, cols, opponent);
+    const libertyDiff = libertyRisk(oppGroups) - libertyRisk(ownGroups);
+
+    // A09: признак выключен по умолчанию; считается только при ненулевом весе,
+    // поэтому цена вычисления по умолчанию не меняется.
+    let edgeDiff = 0;
+    if (weights.edgeEscape){
+      edgeDiff = computeEdgeEscape(state, rows, cols, forPlayer)
+        - computeEdgeEscape(state, rows, cols, opponent);
+    }
+
+    // A09 шаг 2: closeCost — разница угроз «закрыть за 1 ход» (стоимость
+    // закрытия для нас минус стоимость выхода/угроза соперника).
+    // A09 шаг 3: captureRace — если ОБЕ стороны могут пленить за ход, гонку
+    // выигрывает тот, чей ход (ctx.current). Тактика — вне демпфирования формы.
+    let closeDiff = 0, raceVal = 0;
+    if (weights.closeCost || (weights.captureRace && ctx)){
+      const myT = closeInOneThreat(state, rows, cols, forPlayer);
+      const opT = closeInOneThreat(state, rows, cols, opponent);
+      if (weights.closeCost) closeDiff = myT - opT;
+      if (weights.captureRace && ctx && myT > 0 && opT > 0){
+        raceVal = ctx.current === forPlayer ? myT : -opT;
+      }
+    }
+    // A09 шаг 4: phase — потенциал территории обесценивается по мере
+    // заполнения доски (поздно строить, важнее реальные пленения).
+    let potScale = 1;
+    if (weights.phase){
+      let filled = 0;
+      for (let y=0; y<rows; y++) for (let x=0; x<cols; x++) if (stone[y][x] !== 0) filled++;
+      potScale = Math.max(0, 1 - weights.phase * filled / (rows*cols));
+    }
+
+    let v = capturedDiff*CAPTURED_WEIGHT + potentialDiff*weights.potential*potScale + cohesionDiff*weights.cohesion
+      + stoneDiff*weights.stones + libertyDiff*(weights.liberty || 0)
+      + edgeDiff*(weights.edgeEscape || 0) + closeDiff*(weights.closeCost || 0);
+
+    // A09 шаг 5: endgameScore — у порога окончания по очкам (до цели <= 2)
+    // все признаки формы демпфируются, остаётся итоговый счёт (CAPTURED_WEIGHT).
+    if (weights.endgameScore && ctx && ctx.rules && ctx.rules.scoreRuleActive){
+      const sc = ctx.scores || computeScores(state, rows, cols);
+      const left = ctx.rules.targetScore - Math.max(sc[1], sc[2]);
+      if (left <= 2){
+        const keep = Math.max(0, 1 - weights.endgameScore);
+        v = capturedDiff*CAPTURED_WEIGHT + (v - capturedDiff*CAPTURED_WEIGHT) * keep;
+      }
+    }
+    return v + raceVal*(weights.captureRace || 0);
+  }
+
+  function branchFactorForDepth(diff, depth){
+    if (depth >= 3) return diff.branchWide;
+    if (depth === 2) return diff.branchMid;
+    return diff.branchNarrow;
+  }
+
+  function orderedCandidates(state, rows, cols, player, diff, depth){
+    const cand = generateCandidates(state, rows, cols, diff.radius);
+    const urgent = computeUrgentCells(state, rows, cols, player);
+    cand.forEach(c => { c.q = quickScore(state, rows, cols, c.x, c.y, player, urgent); });
+    cand.sort((a,b) => b.q - a.q);
+    return cand.slice(0, branchFactorForDepth(diff, depth));
+  }
+
+  function hasForcingCapture(state, rows, cols, player, diff){
+    const cand = generateCandidates(state, rows, cols, diff.radius)
+      .map(c => ({...c, q: quickScore(state, rows, cols, c.x, c.y, player)}))
+      .sort((a,b) => b.q - a.q)
+      .slice(0, 10);
+    for (const c of cand){
+      const s = cloneState(state);
+      s.stone[c.y][c.x] = player;
+      if (runCaptures(s, player, rows, cols).length) return true;
+    }
+    return false;
+  }
+
+    // ---------- Единый лёгкий переход: матч, поиск, self-play ----------
+  //
+  // Узел — минимальное состояние, достаточное для ПОЛНЫХ правил: три слоя
+  // доски, счёт, очередь хода, счётчик поставленных точек, конец/победитель
+  // и нормализованные правила (порог очков, порог заполнения, доп. ход).
+  // Никакой истории/лога/событий — узел дёшево клонировать на каждом шаге
+  // поиска. createRawMatch.applyMove выполняет ход через тот же
+  // applyTransitionInPlace, поэтому реальная партия и поиск бота не могут
+  // разойтись в трактовке правил.
+
+  function normalizeRules(r){
+    r = r || {};
+    const targetScore = Math.max(0, Math.min(9999, Math.floor(r.targetScore) || 0));
+    let targetFillPercent = r.targetFillPercent;
+    if (typeof targetFillPercent !== 'number' || isNaN(targetFillPercent)) targetFillPercent = 100;
+    targetFillPercent = Math.max(0, Math.min(100, Math.floor(targetFillPercent)));
+    return {
+      targetScore, targetFillPercent,
+      scoreRuleActive: targetScore > 0,
+      fillRuleActive: targetFillPercent > 0 && targetFillPercent < 100,
+      extraTurnOnCapture: r.extraTurnOnCapture === true
+    };
+  }
+
+  function winnerFromScores(scores){
+    return scores[1] > scores[2] ? 1 : (scores[2] > scores[1] ? 2 : 0);
+  }
+
+  // src — снимок матча (getSnapshot()) или объект с полями
+  // stone/dead/territory/rows/cols/current и, по возможности,
+  // stonesPlacedTotal/gameOver/rules. Слои доски копируются. Счёт выводится
+  // из доски (как и в матче). Без stonesPlacedTotal берётся число точек на
+  // доске (захваченные точки остаются на ней, так что это то же число).
+  function createSearchNode(src){
+    const rows = src.rows, cols = src.cols;
+    const state = cloneState({ stone: src.stone, dead: src.dead, territory: src.territory });
+    const scores = computeScores(state, rows, cols);
+    let placed = src.stonesPlacedTotal;
+    if (!Number.isInteger(placed)){
+      placed = 0;
+      for (let y=0; y<rows; y++)
+        for (let x=0; x<cols; x++)
+          if (state.stone[y][x] !== 0) placed++;
+    }
+    const gameOver = src.gameOver === true;
+    return {
+      state, rows, cols, scores,
+      current: src.current === 2 ? 2 : 1,
+      stonesPlacedTotal: placed,
+      gameOver,
+      winner: gameOver ? winnerFromScores(scores) : null,
+      rules: normalizeRules(src.rules)
+    };
+  }
+
+  function cloneSearchNode(node){
+    return {
+      state: cloneState(node.state), rows: node.rows, cols: node.cols,
+      scores: { 1: node.scores[1], 2: node.scores[2] },
+      current: node.current, stonesPlacedTotal: node.stonesPlacedTotal,
+      gameOver: node.gameOver, winner: node.winner, rules: node.rules
+    };
+  }
+
+  // Самоубийство: если точка player-а оказалась в области, уже окружённой
+  // противником (замкнута стеной противника и не касается края), эта
+  // область сразу отходит противнику. Мутирует state.
+  function captureSuicideRegion(state, rows, cols, player, x, y){
+    const opp = player === 1 ? 2 : 1;
+    // B04 (issue #27), шаг 2: плоские типизированные массивы вместо
+    // массивов [x,y]; порядок обхода (DIRS4, стек LIFO) прежний, поэтому
+    // результат и порядок out не меняются.
+    const visited = new Uint8Array(rows * cols);
+    const stack = new Int32Array(rows * cols);
+    const region = new Int32Array(rows * cols);
+    let sp = 0, rn = 0;
+    stack[sp++] = y*cols + x;
+    visited[y*cols + x] = 1;
+    while (sp > 0){
+      const ci = stack[--sp];
+      const cy = (ci / cols) | 0, cx = ci - cy*cols;
+      region[rn++] = ci;
+      if (cx===0 || cy===0 || cx===cols-1 || cy===rows-1) return [];
+      for (let d=0; d<DIRS4.length; d++){
+        const nx=cx+DIRS4[d][0], ny=cy+DIRS4[d][1];
+        if (nx<0||ny<0||nx>=cols||ny>=rows) continue;
+        const ni = ny*cols + nx;
+        if (visited[ni]) continue;
+        visited[ni] = 1;
+        if (isWall(state, nx, ny, opp)) continue;
+        stack[sp++] = ni;
+      }
+    }
+    const out = [];
+    for (let k=0; k<rn; k++){
+      const cy = (region[k] / cols) | 0, cx = region[k] - cy*cols;
+      if (state.stone[cy][cx] === opp){
+        if (state.dead[cy][cx] !== 0){ out.push({x:cx, y:cy, prevOwner: state.dead[cy][cx], kind:'freed'}); state.dead[cy][cx] = 0; }
+      } else if (state.stone[cy][cx] !== 0){
+        if (state.dead[cy][cx] !== opp){ out.push({x:cx, y:cy, prevOwner: state.dead[cy][cx], kind:'captured'}); state.dead[cy][cx] = opp; }
+      } else if (state.territory[cy][cx] !== opp){
+        out.push({x:cx, y:cy, prevOwner: state.territory[cy][cx], kind:'territory'});
+        state.territory[cy][cx] = opp;
+      }
+    }
+    return out;
+  }
+
+  // null — ход допустим, иначе причина отказа (те же коды, что у applyMove).
+  function transitionRejectReason(node, player, x, y){
+    if (node.gameOver) return 'game-over';
+    if (player !== node.current) return 'not-your-turn';
+    const { state, rows, cols } = node;
+    if (!Number.isInteger(x) || !Number.isInteger(y)) return 'illegal-cell';
+    if (x<0 || y<0 || x>=cols || y>=rows) return 'illegal-cell';
+    if (state.stone[y][x] !== 0) return 'illegal-cell';
+    if (state.territory[y][x] !== 0 && state.territory[y][x] === node.current) return 'illegal-cell';
+    if (node.stonesPlacedTotal < 2 && !inZone(x, y, getOpeningZone(rows, cols))) return 'illegal-cell';
+    return null;
+  }
+
+  function isTransitionLegal(node, x, y){
+    return transitionRejectReason(node, node.current, x, y) === null;
+  }
+
+  // Мутирующий переход (используется матчем). Нелегальный ход не трогает узел.
+  function applyTransitionInPlace(node, player, x, y){
+    const reason = transitionRejectReason(node, player, x, y);
+    if (reason) return { ok:false, reason };
+    const { state, rows, cols, rules } = node;
+    state.stone[y][x] = player;
+    if (state.territory[y][x] !== 0) state.territory[y][x] = 0;
+    node.stonesPlacedTotal++;
+
+    // Сначала собственные окружения ходившего (замыкание контура имеет
+    // приоритет), затем — проверка самоубийства в окружении противника.
+    const gained = runCaptures(state, player, rows, cols);
+    let suicide = [];
+    if (state.dead[y][x] === 0) suicide = captureSuicideRegion(state, rows, cols, player, x, y);
+    node.scores = computeScores(state, rows, cols);
+
+    let winner = null;
+    let extraTurn = false;
+    const ended = checkEndConditions({
+      state, rows, cols, scores: node.scores,
+      scoreRuleActive: rules.scoreRuleActive, targetScore: rules.targetScore,
+      fillRuleActive: rules.fillRuleActive, targetFillPercent: rules.targetFillPercent,
+      totalCells: rows*cols
+    });
+    if (ended){
+      node.gameOver = true;
+      winner = winnerFromScores(node.scores);
+      node.winner = winner;
+    } else if (rules.extraTurnOnCapture && countCaptured(gained) > 0){
+      extraTurn = true; // ход остаётся за окружившим
+    } else {
+      node.current = player === 1 ? 2 : 1;
+    }
+
+    return {
+      ok: true, player, x, y,
+      gained, suicide, scores: { ...node.scores }, current: node.current, gameOver: node.gameOver, winner,
+      extraTurn, stonesPlacedTotal: node.stonesPlacedTotal
+    };
+  }
+
+  // Чистый переход для поиска/self-play: вход не мутируется никогда.
+  function applyTransition(node, player, x, y){
+    const reason = transitionRejectReason(node, player, x, y);
+    if (reason) return { ok:false, reason };
+    const child = cloneSearchNode(node);
+    const result = applyTransitionInPlace(child, player, x, y);
+    return { ok:true, node: child, result };
+  }
+
+  // Терминальная оценка: победа/поражение всегда весомее любой эвристики,
+  // ближняя победа лучше дальней. Ничья — 0.
+  const WIN_SCORE = 1e9;
+  function terminalValue(node, forPlayer, ply){
+    if (node.winner === forPlayer) return WIN_SCORE - ply;
+    if (node.winner === 1 || node.winner === 2) return -(WIN_SCORE - ply);
+    return 0;
+  }
+
+  // Кандидаты поиска — только легальные ходы узла, упорядоченные quickScore.
+  function legalCandidates(node, diff){
+    const { state, rows, cols } = node;
+    const player = node.current;
+    let cand = generateCandidates(state, rows, cols, diff.radius);
+    // A08: стратегические кандидаты (разрывы контуров/выходы, дальние зоны);
+    // diff.strategic === false — отключить (ablation).
+    if (diff.strategic !== false && node.stonesPlacedTotal >= 2){
+      // Стратегические ходы помечаются (strategic/zone), чтобы
+      // reserveStrategic гарантированно сохранил их при обрезке beam.
+      const byK = new Map(cand.map(c => [c.y*cols + c.x, c]));
+      for (const s of strategicCandidates(node)){
+        const k = s.y*cols + s.x;
+        let c = byK.get(k);
+        if (!c){ c = { x: s.x, y: s.y }; byK.set(k, c); cand.push(c); }
+        c.strategic = true;
+        if (s.zone) c.zone = true;
+      }
+    }
+    cand = cand.filter(c => isTransitionLegal(node, c.x, c.y));
+    const urgent = computeUrgentCells(state, rows, cols, player);
+    cand.forEach(c => { c.q = quickScore(state, rows, cols, c.x, c.y, player, urgent); });
+    // Детерминированный порядок: quickScore по убыванию, равенства — по y, затем по x.
+    cand.sort((a,b) => (b.q - a.q) || (a.y - b.y) || (a.x - b.x));
+    return cand;
+  }
+
+    // A08 (issue #13): обязательные тактические кандидаты по ПОЛНЫМ правилам —
+  // находятся полным перебором легальных ходов узла ДО эвристической обрезки
+  // (generateCandidates/quickScore/candidateCap/branchFactor), поэтому не
+  // зависят от радиуса соседства и локальных liberties.
+  //   'win'     — ход сразу завершает партию победой ходящего (порог очков/заполнения);
+  //   'capture' — ход реально пленит точки соперника (runCaptures);
+  //   'block'   — клетка, которой соперник (если бы ходил сейчас) пленил бы
+  //               точки или выиграл: занять её — прямая защита от потери.
+  // Возвращает массив {x,y,kinds} в детерминированном порядке (y, затем x).
+  // Отсечение клеток без соседей (8-окрестность без точек/территории) корректно:
+  // такая точка — внутреннее препятствие одной и той же области, она не может
+  // замкнуть контур (ни для ходящего, ни для соперника). Исключение — партия
+  // кончается следующим ходом по заполнению: тогда «выигрывает» любой ход, и
+  // перебираются все клетки. diff.tacticalFullScan=true — всегда полный перебор
+  // (используется тестом сравнения с полным перебором).
+  function nearOccupied(state, rows, cols, x, y){
+    for (let dy=-1; dy<=1; dy++){
+      for (let dx=-1; dx<=1; dx++){
+        if (!dx && !dy) continue;
+        const nx=x+dx, ny=y+dy;
+        if (nx<0||ny<0||nx>=cols||ny>=rows) continue;
+        if (state.stone[ny][nx] !== 0 || state.territory[ny][nx] !== 0) return true;
+      }
+    }
+    return false;
+  }
+  function fillEndsNext(node){
+    const r = node.rules;
+    const total = node.rows*node.cols;
+    const target = r.fillRuleActive ? Math.ceil(total*r.targetFillPercent/100) : total;
+    return countFilledCells(node.state, node.rows, node.cols) + 1 >= target;
+  }
+
+  const TACTICAL_RANK = { win: 0, capture: 1, defend: 2, block: 3 };
+  function tacticalRank(c){
+    let r = 9;
+    for (const k of c.kinds) if (TACTICAL_RANK[k] < r) r = TACTICAL_RANK[k];
+    return r;
+  }
+
+  // A08: стратегические кандидаты вне радиуса соседства —
+  //  * разрывы контуров и пути выхода: свободы групп обеих сторон с <=3 свободами;
+  //  * разные области поля: центр каждой из 3×3 зон доски, в которой ещё нет
+  //    ни одной точки/территории (чтобы поиск видел ходы на дальних флангах).
+  // Возвращает только легальные ходы, порядок детерминирован (y, затем x).
+  function strategicCandidates(node){
+    const { state, rows, cols } = node;
+    const out = new Map();
+    if (node.gameOver) return [];
+        const add = (x, y, zone) => {
+      if (!isTransitionLegal(node, x, y)) return;
+      const k = y*cols + x;
+      const e = out.get(k);
+      if (e){ if (zone) e.zone = true; }
+      else out.set(k, zone ? { x, y, zone: true } : { x, y });
+    };
+    for (const p of [1, 2]){
+      for (const g of computeGroupLiberties(state, rows, cols, p)){
+        if (g.liberties > 3) continue;
+        for (const k of g.libCells) add(k % cols, Math.floor(k / cols));
+      }
+    }
+    // Пути выхода к краю: для групп обеих сторон с <=6 свободами — кратчайший
+    // путь по пустым клеткам от свобод группы до края доски (multi-source BFS).
+    // Кандидаты — первые две клетки пути: свой выход из окружения либо
+    // перекрытие выхода соперника. Группы, уже не имеющие пути к краю, пропускаются.
+    // Обрабатываются не более 6 групп с наименьшим числом свобод (бюджет генерации).
+    const free = (x, y) => state.stone[y][x] === 0 && state.territory[y][x] === 0;
+    const onEdge = (x, y) => x === 0 || y === 0 || x === cols-1 || y === rows-1;
+    let escGroups = [];
+    for (const p of [1, 2]){
+      for (const g of computeGroupLiberties(state, rows, cols, p)){
+        if (g.liberties > 0 && g.liberties <= 6) escGroups.push(g);
+      }
+    }
+    escGroups.sort((a, b) => a.liberties - b.liberties);
+    escGroups = escGroups.slice(0, 6);
+    for (const g of escGroups){
+      const prev = new Int32Array(rows*cols).fill(-2);
+      const q = [];
+      for (const k of g.libCells){
+        const x = k % cols, y = Math.floor(k / cols);
+        if (free(x, y) && prev[k] === -2){ prev[k] = -1; q.push(k); }
+      }
+      let hit = -1;
+      for (let i=0; i<q.length; i++){
+        const k = q[i], x = k % cols, y = Math.floor(k / cols);
+        if (onEdge(x, y)){ hit = k; break; }
+        for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]]){
+          const nx = x+dx, ny = y+dy;
+          if (nx<0||ny<0||nx>=cols||ny>=rows) continue;
+          const nk = ny*cols + nx;
+          if (prev[nk] !== -2 || !free(nx, ny)) continue;
+          prev[nk] = k; q.push(nk);
+        }
+      }
+      if (hit < 0) continue;
+      const path = [];
+      for (let k = hit; k !== -1; k = prev[k]) path.push(k);
+      path.reverse();
+      for (const k of path.slice(0, 2)) add(k % cols, Math.floor(k / cols));
+    }
+    for (let zy=0; zy<3; zy++){
+      for (let zx=0; zx<3; zx++){
+        const x0 = Math.floor(zx*cols/3), x1 = Math.floor((zx+1)*cols/3) - 1;
+        const y0 = Math.floor(zy*rows/3), y1 = Math.floor((zy+1)*rows/3) - 1;
+        let empty = true;
+        for (let y=y0; y<=y1 && empty; y++)
+          for (let x=x0; x<=x1 && empty; x++)
+            if (state.stone[y][x] !== 0 || state.territory[y][x] !== 0) empty = false;
+        if (empty && x1 >= x0 && y1 >= y0) add(Math.floor((x0+x1)/2), Math.floor((y0+y1)/2), true);
+      }
+    }
+    return Array.from(out.values()).sort((a,b) => (a.y - b.y) || (a.x - b.x));
+  }
+
+  // A08: итоговый набор кандидатов узла с обрезкой до cap.
+  // Обязательные тактические ходы (win > capture > block, затем quickScore)
+  // идут первыми и НЕ вытесняются эвристикой. Если их больше cap, сохраняются
+  // ВСЕ обязательные ходы (beam расширяется), обычные ходы при этом не
+  // добавляются; переполнение учитывается в sc.tacticalOverflow.
+  // Стоимость генерации считается в sc.tacticalScans (поиск проверяет бюджет
+  // сразу после генерации). diff.tactical === false — прежнее поведение (ablation).
+  function searchCandidates(node, diff, cap, sc, tac){
+    const base = legalCandidates(node, diff);
+    return reserveStrategic(searchCandidatesCore(node, diff, cap, sc, tac, base), base, cap, diff);
+  }
+
+  // A08: ГАРАНТИЯ сохранения стратегических кандидатов до поиска. Без неё
+  // локальный quickScore вытесняет из beam дальние области и выходы к краю.
+  // Резервируется R = diff.strategicReserve мест (по умолчанию max(2, ceil(cap/3))):
+  // сначала до ceil(R/2) представителей пустых зон доски (дальние фланги),
+  // затем разрывы контуров и пути выхода к краю по quickScore, затем
+  // оставшиеся зоны. Место освобождается вытеснением ОБЫЧНЫХ ходов с конца.
+  // Обязательная тактика не вытесняется никогда: если весь beam занят ею,
+  // beam расширяется. diff.strategic === false или strategicReserve = 0 — выкл.
+  function reserveStrategic(sel, base, cap, diff){
+    if (diff.strategic === false) return sel;
+    const R = Number.isInteger(diff.strategicReserve) && diff.strategicReserve >= 0
+      ? diff.strategicReserve : Math.max(2, Math.ceil(cap/3));
+    if (!R) return sel;
+    const k = c => c.x + ',' + c.y;
+    const inSel = new Set(sel.map(k));
+    const have = sel.filter(c => c.strategic).length;
+    const haveZ = sel.filter(c => c.zone).length;
+    const zones = base.filter(c => c.zone && !inSel.has(k(c)));
+    const others = base.filter(c => c.strategic && !c.zone && !inSel.has(k(c)));
+    const picks = [];
+    // Квота зон считается отдельно: локальные выходы, уже попавшие в beam,
+    // не должны вытеснять представителей дальних областей.
+    const zcap = Math.ceil(R/2);
+    let zi = 0;
+    while (zi < zones.length && haveZ + zi < zcap) picks.push(zones[zi++]);
+    for (const o of others){ if (have + picks.length >= R) break; picks.push(o); }
+    while (zi < zones.length && have + picks.length < R) picks.push(zones[zi++]);
+    if (!picks.length) return sel;
+    const out = sel.slice();
+    let over = out.length + picks.length - cap;
+    for (let i = out.length - 1; i >= 0 && over > 0; i--){
+      if (!out[i].tactical && !out[i].strategic){ out.splice(i, 1); over--; }
+    }
+    return out.concat(picks);
+  }
+
+  function searchCandidatesCore(node, diff, cap, sc, tac, base){
+    if (diff.tactical === false) return base.slice(0, cap);
+    if (!tac) tac = tacticalCandidates(node, diff, sc);
+    if (sc) sc.tacticalScans = (sc.tacticalScans || 0) + 1;
+    // Бюджет исчерпан во время генерации: набор неполон, вызывающий
+    // поиск отбросит узел (sc.aborted) — возвращаем прежний beam.
+    if (sc && sc.aborted) return base.slice(0, cap);
+    if (!tac.length) return base.slice(0, cap);
+    const { state, rows, cols } = node;
+    const byKey = new Map(base.map(c => [c.y*cols + c.x, c]));
+    const forced = tac.map(t => {
+      const b = byKey.get(t.y*cols + t.x);
+      return { x: t.x, y: t.y, kinds: t.kinds.slice(), tactical: true,
+        q: b ? b.q : quickScore(state, rows, cols, t.x, t.y, node.current, null) };
+    });
+    forced.sort((a,b) => (tacticalRank(a) - tacticalRank(b)) || (b.q - a.q) || (a.y - b.y) || (a.x - b.x));
+    // A08: обязательные ходы НИКОГДА не обрезаются. Если их больше cap, beam
+    // расширяется до числа обязательных ходов, обычные ходы не добавляются;
+    // переполнение учитывается в sc.tacticalOverflow. Стоимость лишних детей
+    // ограничивается бюджетом A04 (проверка перед каждым ребёнком), а не
+    // отбрасыванием обязательной тактики.
+    if (forced.length > cap && sc) sc.tacticalOverflow = (sc.tacticalOverflow || 0) + 1;
+    const kept = forced;
+    const keys = new Set(kept.map(c => c.y*cols + c.x));
+    const rest = base.filter(c => !keys.has(c.y*cols + c.x)).slice(0, Math.max(0, cap - kept.length));
+    return kept.concat(rest);
+  }
+
+  // sc (необязательный) — бюджет поиска A04: генерация проверяет его на
+  // каждой строке доски в обоих проходах; при исчерпании возвращает [] и
+  // оставляет sc.aborted = true (stopAt = 'tactical-gen'), узел отбрасывается.
+  function tacticalCandidates(node, diff, sc){
+    const { rows, cols, state } = node;
+    const out = new Map();
+    if (node.gameOver) return [];
+    const over = () => !!(sc && sc.clock && budgetExceeded(sc, 'tactical-gen'));
+    if (over()) return [];
+    const fullScan = (diff && diff.tacticalFullScan === true) || fillEndsNext(node);
+    const player = node.current;
+    const opp = player === 1 ? 2 : 1;
+    const add = (x, y, kind) => {
+      const k = y*cols + x;
+      const e = out.get(k);
+      if (e){ if (!e.kinds.includes(kind)) e.kinds.push(kind); }
+      else out.set(k, { x, y, kinds: [kind] });
+    };
+    const oppNode = cloneSearchNode(node);
+    oppNode.current = opp;
+    const threats = []; // клетки немедленных угроз соперника
+    let oldMax = 0;     // лучший немедленный выигрыш соперника без нашего хода
+    for (let y=0; y<rows; y++){
+      if (over()) return [];
+      for (let x=0; x<cols; x++){
+        if (!fullScan && !nearOccupied(state, rows, cols, x, y)) continue;
+        if (isTransitionLegal(node, x, y)){
+          const t = applyTransition(node, player, x, y);
+          if (t.ok){
+            if (t.node.gameOver && t.node.winner === player) add(x, y, 'win');
+            if (countCaptured(t.result.gained) > 0) add(x, y, 'capture');
+          }
+        }
+        if (isTransitionLegal(oppNode, x, y)){
+          const g = oppThreatGain(oppNode, opp, x, y);
+          if (g > 0){
+            threats.push(y*cols + x);
+            if (g > oldMax) oldMax = g;
+            if (isTransitionLegal(node, x, y)) add(x, y, 'block');
+          }
+        }
+      }
+    }
+    // A08: 'defend' — ПРОВЕРЕННАЯ защита по полным правилам. Для каждого
+    // легального хода делается переход, затем для соперника заново считается
+    // лучший немедленный выигрыш (победа = Infinity, иначе число пленённых
+    // точек) на клетках прежних угроз и в окрестности радиуса 2 нашего хода
+    // (только там наш ход может создать новую угрозу). Ход помечается
+    // 'defend', если немедленная потеря после него строго меньше, чем без него
+    // (включая ходы не на клетке угрозы: захват атакующих точек, перекрытие).
+    // Захват с доп. ходом (соперник сейчас не ходит) и собственная победа
+    // также считаются защитой. diff.tacticalDefend === false — выключить.
+    if (threats.length && !(diff && diff.tacticalDefend === false)){
+      for (let y=0; y<rows; y++){
+        if (over()) return [];
+        for (let x=0; x<cols; x++){
+          if (!fullScan && !nearOccupied(state, rows, cols, x, y)) continue;
+          if (!isTransitionLegal(node, x, y)) continue;
+          const t = applyTransition(node, player, x, y);
+          if (!t.ok) continue;
+                    // Немедленное завершение партии своим ходом — защита, если оно не
+          // проигрышное: победа или НИЧЬЯ (после конца партии потеря соперника
+          // = 0 < oldMax; в т.ч. ничья вместо немедленного поражения).
+          if (t.node.gameOver){ if (t.node.winner !== opp) add(x, y, 'defend'); continue; }
+          if (t.node.current !== opp){ add(x, y, 'defend'); continue; }
+          const check = new Set(threats);
+          for (let dy=-2; dy<=2; dy++) for (let dx=-2; dx<=2; dx++){
+            const nx = x+dx, ny = y+dy;
+            if (nx>=0 && ny>=0 && nx<cols && ny<rows) check.add(ny*cols + nx);
+          }
+          let newMax = 0;
+          for (const k of check){
+            const cx = k % cols, cy = Math.floor(k / cols);
+            if (!isTransitionLegal(t.node, cx, cy)) continue;
+            const g = oppThreatGain(t.node, opp, cx, cy);
+            if (g > newMax) newMax = g;
+            if (newMax >= oldMax) break;
+          }
+          if (newMax < oldMax) add(x, y, 'defend');
+        }
+      }
+    }
+    return Array.from(out.values()).sort((a,b) => (a.y - b.y) || (a.x - b.x));
+  }
+
+  // Немедленный выигрыш соперника ходом (x,y) из узла, где он ходит:
+  // Infinity — победа, иначе число пленённых точек (0 — угрозы нет).
+  function oppThreatGain(oppNode, opp, x, y){
+    const t = applyTransition(oppNode, opp, x, y);
+    if (!t.ok) return 0;
+    if (t.node.gameOver && t.node.winner === opp) return Infinity;
+    return countCaptured(t.result.gained);
+  }
+
+    // A08: обязательная тактика во ВНУТРЕННИХ узлах и продлениях. Полный скан
+  // слишком дорог для каждого узла, поэтому проверяются (тем же полным
+  // переходом applyTransition, по полным правилам) только клетки, где набор
+  // мог измениться или уже был непуст:
+  //   * обязательные клетки родителя (hint.cells — захват/защита родителя
+  //     здесь остаются захватом/защитой, пока ход их не отменил);
+  //   * окрестность радиуса 2 последнего хода (hint.move);
+  //   * свободы групп обеих сторон с <=2 свободами.
+  // Без hint (дети корня) и когда партия кончается следующим ходом по
+  // заполнению — полный скан tacticalCandidates. diff.tacticalInternal === false
+  // — прежнее поведение (ablation).
+  function tacticalCandidatesLocal(node, diff, hint){
+    const { rows, cols, state } = node;
+    if (node.gameOver) return [];
+    if (!hint || fillEndsNext(node)) return tacticalCandidates(node, diff);
+    const cells = new Set();
+    const addCell = (x, y) => { if (x>=0 && y>=0 && x<cols && y<rows) cells.add(y*cols + x); };
+    if (hint.move){
+      for (let dy=-1; dy<=1; dy++) for (let dx=-1; dx<=1; dx++) addCell(hint.move.x+dx, hint.move.y+dy);
+    }
+    if (hint.cells) for (const c of hint.cells) addCell(c.x, c.y);
+    for (const p of [1, 2]){
+      for (const g of computeGroupLiberties(state, rows, cols, p)){
+        if (g.liberties > 1) continue;
+        for (const k of g.libCells) cells.add(k);
+      }
+    }
+    const player = node.current;
+    const opp = player === 1 ? 2 : 1;
+    const out = new Map();
+    const add = (x, y, kind) => {
+      const k = y*cols + x;
+      const e = out.get(k);
+      if (e){ if (!e.kinds.includes(kind)) e.kinds.push(kind); }
+      else out.set(k, { x, y, kinds: [kind] });
+    };
+    const oppNode = cloneSearchNode(node);
+    oppNode.current = opp;
+    for (const k of cells){
+      const x = k % cols, y = Math.floor(k / cols);
+      if (!isTransitionLegal(node, x, y)) continue;
+      const t = applyTransition(node, player, x, y);
+      if (t.ok){
+        if (t.node.gameOver && t.node.winner === player) add(x, y, 'win');
+        if (countCaptured(t.result.gained) > 0) add(x, y, 'capture');
+      }
+      if (isTransitionLegal(oppNode, x, y)){
+        const o = applyTransition(oppNode, opp, x, y);
+        if (o.ok && ((o.node.gameOver && o.node.winner === opp) || countCaptured(o.result.gained) > 0)) add(x, y, 'block');
+      }
+    }
+    return Array.from(out.values()).sort((a,b) => (a.y - b.y) || (a.x - b.x));
+  }
+
+  function firstLegalMove(node){
+    for (let y=0; y<node.rows; y++)
+      for (let x=0; x<node.cols; x++)
+        if (isTransitionLegal(node, x, y)) return {x, y};
+    return null;
+  }
+
+  // Игрок узла — всегда фактический node.current: после захвата с
+  // доп. ходом поиск продолжает за того же игрока, а не за соперника.
+  // Терминальный узел не порождает продолжений и оценивается терминально.
+  // (Прежний alphaBeta с ±Infinity и без распространения abort заменён
+  // alphaBetaSearch ниже — см. A04, issue #9.)
+
+  // ctx (необязательный) — полные правила позиции: { stonesPlacedTotal,
+  // gameOver, rules } (подходит прямо getSnapshot() матча). Без ctx —
+  // прежние правила по умолчанию: без порогов и доп. хода, конец только при
+  // полном поле, stonesPlacedTotal = число точек на доске.
+  // ---------- Поиск с явным бюджетом (A04, issue #9) ----------
+  // Бюджет поиска: детерминированный лимит узлов (тесты/benchmark) и/или
+  // таймер (реальная игра). clock можно подменить управляемыми часами.
+  function createSearchBudget(opts){
+    const clock = typeof opts.clock === 'function' ? opts.clock : now;
+    const start = clock();
+    const tl = Number(opts.timeLimit);
+    const deadline = (opts.timeLimit !== undefined && opts.timeLimit !== null && Number.isFinite(tl) && tl >= 0)
+      ? start + tl : Infinity;
+    const nl = Math.floor(Number(opts.nodeLimit));
+    return { clock, start, deadline, nodeLimit: Number.isFinite(nl) && nl > 0 ? nl : 0,
+      nodes: 0, aborted: false, stopReason: null };
+  }
+
+  // Проверка бюджета; при исчерпании поиск помечается прерванным (abort
+  // распространяется вверх через sc.aborted — значения прерванных узлов
+  // не используются никем).
+  // where — метка точки проверки (для trace.stopAt и тестов): 'root',
+  // 'node', 'extension-before'/'extension-after' (вокруг проверки продления),
+  // 'extension-node' (внутри узла продления), 'static-eval'.
+  function budgetExceeded(sc, where){
+    if (sc.aborted) return true;
+    if (sc.nodeLimit > 0 && sc.nodes >= sc.nodeLimit){ sc.aborted = true; sc.stopReason = 'node-limit'; }
+    else if (sc.clock() > sc.deadline){ sc.aborted = true; sc.stopReason = 'time'; }
+    if (sc.aborted) sc.stopAt = where || 'root';
+    return sc.aborted;
+  }
+
+  function finiteScore(v, fallback){ return Number.isFinite(v) ? v : fallback; }
+
+  // Возвращает конечную оценку. Если после вызова sc.aborted === true —
+  // результат недействителен и должен быть отброшен вызывающим.
+    // hint (A08, необязательный): { move, cells } — последний ход родителя и его
+  // обязательные клетки, для инкрементального тактического скана.
+  function alphaBetaSearch(node, depth, alpha, beta, diff, sc, forPlayer, weights, extensionsLeft, ply, hint){
+    if (node.gameOver) return terminalValue(node, forPlayer, ply);
+    // Узел продления: depth<=0, но поиск продолжается из-за форсированных ходов.
+    const inExt = depth <= 0;
+    if (budgetExceeded(sc, inExt ? 'extension-node' : 'node')) return 0;
+    sc.nodes++;
+    const { state, rows, cols } = node;
+    const player = node.current;
+    // Статическая оценка — дорогая операция: бюджет проверяется перед ней
+    // (при исчерпании узел прерывается, значение отбрасывается вызывающим).
+    // B04 (issue #27), шаг 3: таблица транспозиций статических оценок в
+    // пределах одного searchMove (sc живёт один поиск, forPlayer/weights в нём
+    // постоянны). Ключ — полная позиция: очередь хода, правила
+    // (targetScore/targetFillPercent/extraTurnOnCapture), stonesPlacedTotal и
+    // все три слоя доски. evaluateStatic детерминирована, поэтому значение из
+    // таблицы идентично пересчёту: узлы/ходы при одинаковом nodeLimit не
+    // меняются. Размер ограничен (EVAL_TT_MAX), чтобы не раздувать память.
+    const staticVal = () => {
+      if (budgetExceeded(sc, 'static-eval')) return 0;
+      const r = node.rules;
+      let key = node.current + '|' + r.targetScore + ',' + r.targetFillPercent + ',' + (r.extraTurnOnCapture ? 1 : 0)
+        + '|' + node.stonesPlacedTotal + '|';
+      for (let yy=0; yy<rows; yy++){
+        const sr = state.stone[yy], dr = state.dead[yy], tr = state.territory[yy];
+        for (let xx=0; xx<cols; xx++) key += String.fromCharCode(65 + sr[xx] + 3*dr[xx] + 9*tr[xx]);
+      }
+      if (!sc.evalTT) sc.evalTT = new Map();
+      const hit = sc.evalTT.get(key);
+      if (hit !== undefined){ sc.evalHits = (sc.evalHits || 0) + 1; return hit; }
+      const v = finiteScore(evaluateStatic(state, rows, cols, forPlayer, weights, node), 0);
+      if (sc.evalTT.size < 200000) sc.evalTT.set(key, v);
+      return v;
+    };
+    let forcedTac = null; // A08: тактический набор, уже посчитанный для продления
+    // A08: полный тактический скан стоит O(rows*cols) переходов, поэтому во
+    // внутренних узлах он выполняется только до ply <= diff.tacticalPly
+    // (по умолчанию 0 — корень считается в searchMove) и в узлах продления.
+    // diff.tacticalExtScan === true — полный скан как условие продления в
+    // каждом листе (дорого; по умолчанию условие — прежняя дешёвая проверка,
+    // а набор ходов продления берётся из полного тактического скана).
+    const tacOn = diff.tactical !== false;
+    const tacPly = Number.isInteger(diff.tacticalPly) ? diff.tacticalPly : 0;
+    const tacInternal = diff.tacticalInternal !== false;
+    if (depth <= 0){
+      if (extensionsLeft <= 0) return staticVal();
+      // Продление — дорогая операция: бюджет проверяется до и после неё.
+      if (budgetExceeded(sc, 'extension-before')) return 0;
+      let forced;
+      if (tacOn && diff.tacticalExtScan === true){
+        forcedTac = tacticalCandidates(node, diff);
+        forced = forcedTac.length > 0 || hasUrgentAtari(state, rows, cols, player);
+      } else if (tacOn && tacInternal){
+        // A08: продление решается по обязательной тактике полных правил
+        // (инкрементальный скан), а не только по локальным liberties.
+        forcedTac = tacticalCandidatesLocal(node, diff, hint);
+        forced = forcedTac.length > 0 || hasForcingCapture(state, rows, cols, player, diff)
+          || hasUrgentAtari(state, rows, cols, player);
+      } else {
+        forced = hasForcingCapture(state, rows, cols, player, diff) || hasUrgentAtari(state, rows, cols, player);
+      }
+      if (budgetExceeded(sc, 'extension-after')) return 0;
+      if (!forced) return staticVal();
+    }
+    const searchDepth = depth > 0 ? depth : 1;
+    const bf = branchFactorForDepth(diff, searchDepth);
+    // A08: во внутренних узлах обязательная тактика по умолчанию тоже
+    // сохраняется до обрезки branchFactor (инкрементальный скан от родителя).
+        // Полный набор во ВСЕХ внутренних узлах раздувает beam и расходует бюджет
+    // узлов, поэтому по умолчанию он включается только в продлениях;
+    // diff.tacticalInternalNodes === true — во всех внутренних узлах (ablation).
+    if (tacOn && tacInternal && diff.tacticalInternalNodes === true && !forcedTac && ply > tacPly){
+      if (budgetExceeded(sc, inExt ? 'extension-node' : 'node')) return 0;
+      forcedTac = tacticalCandidatesLocal(node, diff, hint);
+    }
+    const useTac = tacOn && (ply <= tacPly || forcedTac);
+    const candidates = useTac ? searchCandidates(node, diff, bf, sc, forcedTac)
+      : legalCandidates(node, diff).slice(0, bf);
+    if (budgetExceeded(sc, inExt ? 'extension-node' : 'node')) return 0;
+    if (!candidates.length) return staticVal();
+
+    const maximizing = player === forPlayer;
+    let value = null;
+    const nextDepth = depth > 0 ? depth - 1 : 0;
+    const nextExt = depth > 0 ? extensionsLeft : extensionsLeft - 1;
+
+    for (const c of candidates){
+      if (budgetExceeded(sc, inExt ? 'extension-node' : 'node')) return 0;
+      const t = applyTransition(node, player, c.x, c.y);
+      if (!t.ok) continue;
+            const childVal = alphaBetaSearch(t.node, nextDepth, alpha, beta, diff, sc, forPlayer, weights, nextExt, ply + 1,
+        { move: { x: c.x, y: c.y }, cells: forcedTac || null });
+      if (sc.aborted) return 0;
+      if (value === null || (maximizing ? childVal > value : childVal < value)) value = childVal;
+      if (maximizing) alpha = Math.max(alpha, value);
+      else beta = Math.min(beta, value);
+      if (beta <= alpha) break;
+    }
+    // Значение детей уже конечно; статическая оценка (с проверкой бюджета)
+    // считается только если ни одного ребёнка не было или значение не конечно.
+    if (value !== null && Number.isFinite(value)) return value;
+    return staticVal();
+  }
+
+  // Полный поиск с диагностикой. opts: { stonesPlacedTotal, gameOver, rules,
+  // nodeLimit, timeLimit, emergencyTimeLimit, clock }.
+  // С nodeLimit поиск детерминирован: таймер только аварийный
+  // (emergencyTimeLimit/timeLimit, по умолчанию выключен). Без nodeLimit —
+  // прежний таймер diff.timeLimit (мягкий, не жёсткий real-time).
+  // Возвращает { move, trace }; принимается только полностью завершённая
+  // итерация, иначе — ход предыдущей завершённой или первый по порядку
+  // кандидатов (сортировка quickScore, равенства — по y, затем x).
+  // ---------- issue #52: угроза «сети» за 2 хода ----------
+  // Разбор реплеев проигранных партий (tools/bench/corpus/human, см.
+  // tools/bench/replay-blunders.js) показал типичную ошибку strong: ход бота
+  // создаёт позицию, где соперник ДВУМЯ своими ходами подряд пленит большую
+  // группу (пример: replays01#0, ход 48 — угроза растёт с 1 до 11 точек, через
+  // 4 хода соперник забирает 12). Поиск глубины 3 с узким beam этого не видит,
+  // а статическая оценка плоская (разброс корневых оценок ~40 при цене точки 100).
+  // twoMoveThreat(node, p) — сколько точек игрок p пленит за 2 своих хода
+  // подряд (без ответа другой стороны) по ПОЛНЫМ правилам. Перебор ограничен
+  // клетками рядом с занятыми (как в tacticalCandidates: изолированная точка
+  // не замыкает контур).
+  function twoMoveThreat(node, p){
+    if (node.gameOver) return 0;
+    const n = cloneSearchNode(node);
+    n.current = p;
+    const { rows, cols } = n;
+    let best = 0;
+    for (let y=0; y<rows; y++){
+      for (let x=0; x<cols; x++){
+        if (!nearOccupied(n.state, rows, cols, x, y) || !isTransitionLegal(n, x, y)) continue;
+        const t = applyTransition(n, p, x, y);
+        if (!t.ok) continue;
+        const c1 = countCaptured(t.result.gained);
+        if (c1 > best) best = c1;
+        if (t.node.gameOver) continue;
+        t.node.current = p;
+        const s = t.node.state;
+        for (let y2=0; y2<rows; y2++){
+          for (let x2=0; x2<cols; x2++){
+            if (!nearOccupied(s, rows, cols, x2, y2) || !isTransitionLegal(t.node, x2, y2)) continue;
+            const u = applyTransition(t.node, p, x2, y2);
+            if (!u.ok) continue;
+            const v = c1 + countCaptured(u.result.gained);
+            if (v > best) best = v;
+          }
+        }
+      }
+    }
+    return best;
+  }
+
+  // Корневой фильтр безопасности (diff.safety2): среди лучших по поиску
+  // кандидатов (diff.safety2Top, по умолчанию 8) штрафует ходы, после которых
+  // угроза соперника за 2 хода (минус собственный захват этим ходом) больше
+  // минимальной хотя бы на 2 точки: штраф SAFETY2_WEIGHT за каждую лишнюю
+  // точку. Детерминирован (не зависит от часов). Форсированные победы/
+  // поражения (|score| >= WIN_SCORE/2) не трогаются.
+  const SAFETY2_WEIGHT = 50;
+
+  // ---------- issue #52: анти-вилка (3 полухода) ----------
+  // oneMoveGain(node, p, cap) — лучший захват игрока p одним ходом (победа = 100).
+  // cap — ранний выход, как только найден захват >= cap.
+  function oneMoveGain(node, p, cap){
+    const n = cloneSearchNode(node);
+    n.current = p;
+    const { rows, cols } = n;
+    let best = 0;
+    for (let y=0; y<rows; y++) for (let x=0; x<cols; x++){
+      if (!nearOccupied(n.state, rows, cols, x, y) || !isTransitionLegal(n, x, y)) continue;
+      const t = applyTransition(n, p, x, y);
+      if (!t.ok) continue;
+      if (t.node.gameOver && t.node.winner === p) return 100;
+      const g = countCaptured(t.result.gained);
+      if (g > best){ best = g; if (cap !== undefined && best >= cap) return best; }
+    }
+    return best;
+  }
+
+  // forkLoss(node, opp, mover) — позиция после нашего хода, ходит opp.
+  // Сколько точек opp гарантированно заберёт за ход-ответ + следующий ход,
+  // если мы защищаемся лучшим ходом в радиусе 3 от его ответа. Это ловит
+  // вилку (ход, создающий две угрозы сразу) ДО того, как она сыграна:
+  // в replays01#0 бот допустил ответ (10,5), после которого ни одна защита
+  // не опускала потерю ниже 11 точек.
+  function forkLoss(node, opp, mover){
+    const { rows, cols } = node;
+    let worst = 0;
+    for (let y=0; y<rows; y++) for (let x=0; x<cols; x++){
+      if (!nearOccupied(node.state, rows, cols, x, y) || !isTransitionLegal(node, x, y)) continue;
+      const t = applyTransition(node, opp, x, y);
+      if (!t.ok) continue;
+      if (t.node.gameOver){ if (t.node.winner === opp) return 100; continue; }
+      const imm = countCaptured(t.result.gained);
+      let loss;
+      if (t.node.current === opp){
+        loss = imm + oneMoveGain(t.node, opp);
+      } else {
+        const th = oneMoveGain(t.node, opp);
+        if (th < 2 || imm + th <= worst) loss = imm;
+        else {
+          let bestDef = th;
+          for (let dy=-3; dy<=3 && bestDef>0; dy++) for (let dx=-3; dx<=3 && bestDef>0; dx++){
+            const dxp = x+dx, dyp = y+dy;
+            if (dxp<0 || dyp<0 || dxp>=cols || dyp>=rows) continue;
+            if (!isTransitionLegal(t.node, dxp, dyp)) continue;
+            const u = applyTransition(t.node, mover, dxp, dyp);
+            if (!u.ok) continue;
+            if (u.node.gameOver){ if (u.node.winner !== opp) bestDef = 0; continue; }
+            if (u.node.current === mover){ bestDef = 0; continue; }
+            const mine = countCaptured(u.result.gained);
+            const g = Math.max(0, oneMoveGain(u.node, opp, bestDef + mine) - mine);
+            if (g < bestDef) bestDef = g;
+          }
+          loss = imm + bestDef;
+        }
+      }
+      if (loss > worst) worst = loss;
+    }
+    return worst;
+  }
+  // Экспорт для тестов через уже экспортированную функцию.
+  twoMoveThreat.forkLoss = forkLoss;
+
+    // ---------- issue #52: анти-вилка на 4 полухода ----------
+  // Ошибка из replays01#0 (полуход 46): ход бота (5,7) позволил ответ (10,5),
+  // после которого ни одна защита не опускала «сеть за 2 хода» ниже 11 точек.
+  // Это видно только на глубине: наш ход -> ответ соперника -> наша защита ->
+  // соперник ходит дважды. forkLoss4 считает такую гарантированную потерю.
+  //
+  // localNetThreat — сеть за 2 хода, где первый ход в радиусе R от (fx,fy):
+  // дешёвый фильтр «создал ли ответ соперника новую сеть рядом с собой».
+  function localNetThreat(node, p, fx, fy, R){
+    const n = cloneSearchNode(node);
+    n.current = p;
+    const { rows, cols } = n;
+    let best = 0, cells = [];
+    for (let dy=-R; dy<=R; dy++) for (let dx=-R; dx<=R; dx++){
+      const x = fx+dx, y = fy+dy;
+      if (x<0 || y<0 || x>=cols || y>=rows) continue;
+      if (!nearOccupied(n.state, rows, cols, x, y) || !isTransitionLegal(n, x, y)) continue;
+      const t = applyTransition(n, p, x, y);
+      if (!t.ok) continue;
+      const c1 = countCaptured(t.result.gained);
+      if (c1 > best){ best = c1; cells = [{ x, y }]; }
+      if (t.node.gameOver) continue;
+      t.node.current = p;
+      const s = t.node.state;
+      for (let y2=0; y2<rows; y2++) for (let x2=0; x2<cols; x2++){
+        if (!nearOccupied(s, rows, cols, x2, y2) || !isTransitionLegal(t.node, x2, y2)) continue;
+        const u = applyTransition(t.node, p, x2, y2);
+        if (!u.ok) continue;
+        const v = c1 + countCaptured(u.result.gained);
+        if (v > best){ best = v; cells = [{ x, y }, { x: x2, y: y2 }]; }
+      }
+    }
+    return { v: best, cells };
+  }
+
+  // forkLoss4(node, opp, mover, ctx) — node: позиция после нашего хода, ходит
+  // opp. Худшая по ответам соперника потеря, которую мы не можем предотвратить
+  // защитой (защиты: радиус 2 от ответа и радиус 1 от клеток найденной сети).
+  // ctx = { calls, cap, thr }: учёт работы в «вызовах twoMoveThreat»
+  // (локальный фильтр ~0.35); при превышении cap возвращает null
+  // (детерминирован, не зависит от часов).
+  function forkLoss4(node, opp, mover, ctx){
+    const { rows, cols } = node;
+    let worst = 0, worstAt = null;
+    for (let y=0; y<rows; y++) for (let x=0; x<cols; x++){
+      // ctx.deadline (Date.now(), мс; #83) — необязательный жёсткий дедлайн:
+      // без него поведение детерминировано, как раньше.
+      if (ctx.calls > ctx.cap || (ctx.deadline && Date.now() > ctx.deadline)){ ctx.aborted = true; return null; }
+      if (!nearOccupied(node.state, rows, cols, x, y) || !isTransitionLegal(node, x, y)) continue;
+      const t = applyTransition(node, opp, x, y);
+      if (!t.ok) continue;
+      if (t.node.gameOver){ if (t.node.winner === opp) return { loss: 100, at: { x, y } }; continue; }
+      const imm = countCaptured(t.result.gained);
+      let loss = imm;
+      if (t.node.current === opp){
+        loss = imm + oneMoveGain(t.node, opp);
+      } else {
+        ctx.calls += 0.35;
+        const net = localNetThreat(t.node, opp, x, y, 2);
+        if (net.v >= ctx.thr && imm + net.v > worst){
+          const defs = new Set();
+          const addR = (cx, cy, r) => {
+            for (let ey=-r; ey<=r; ey++) for (let ex=-r; ex<=r; ex++){
+              const nx = cx+ex, ny = cy+ey;
+              if (nx>=0 && ny>=0 && nx<cols && ny<rows) defs.add(ny*cols + nx);
+            }
+          };
+          addR(x, y, 2);
+          for (const c of net.cells) addR(c.x, c.y, 1);
+          let bestDef = Infinity;
+          for (const k of defs){
+            if (bestDef < ctx.thr) break;
+            if (ctx.calls > ctx.cap || (ctx.deadline && Date.now() > ctx.deadline)){ ctx.aborted = true; return null; }
+            const ex = k % cols, ey = Math.floor(k / cols);
+            if (!isTransitionLegal(t.node, ex, ey)) continue;
+            const u = applyTransition(t.node, mover, ex, ey);
+            if (!u.ok) continue;
+            if (u.node.gameOver){ if (u.node.winner !== opp) bestDef = 0; continue; }
+            if (u.node.current === mover){ bestDef = 0; continue; }
+            const mine = countCaptured(u.result.gained);
+            ctx.calls += 1;
+            const g = Math.max(0, twoMoveThreat(u.node, opp) - mine);
+            if (g < bestDef) bestDef = g;
+          }
+          if (!Number.isFinite(bestDef)) bestDef = net.v;
+          loss = imm + bestDef;
+        }
+      }
+      if (loss > worst){ worst = loss; worstAt = { x, y }; }
+    }
+    return { loss: worst, at: worstAt };
+  }
+  twoMoveThreat.forkLoss4 = forkLoss4;
+
+  // applyAntiFork (diff.antiFork): для diff.antiForkTop лучших кандидатов
+  // (после штрафа safety2) считает forkLoss4; если у лучшего хода есть
+  // опасный ответ соперника, его клетка (ключевая точка вилки) тоже
+  // проверяется как наш ход — занять её самому. Ход с потерей больше
+  // минимальной на (thr-1) и более штрафуется SAFETY2_WEIGHT за точку.
+  // При превышении бюджета (diff.antiForkCap) фильтр не применяется.
+  function applyAntiFork(root, mover, diff, top, pick){
+    const opp = mover === 1 ? 2 : 1;
+    const ctx = { calls: 0, cap: diff.antiForkCap || 60, thr: diff.antiForkThreshold || 4, aborted: false };
+    const pool = top.filter(c => Number.isFinite(c.adj)).sort((a,b) => b.adj - a.adj).slice(0, diff.antiForkTop || 3);
+    if (!pool.length) return { pick, info: null };
+    const evalC = c => {
+      const t = applyTransition(root, mover, c.x, c.y);
+      if (!t.ok) return null;
+      if (t.node.gameOver || t.node.current === mover) return { loss: 0, at: null };
+      const mine = countCaptured(t.result.gained);
+      const r = forkLoss4(t.node, opp, mover, ctx);
+      return r ? { loss: Math.max(0, r.loss - mine), at: r.at } : null;
+    };
+    for (const c of pool){
+      c.fork = evalC(c);
+      if (!c.fork) return { pick, info: { aborted: true, calls: Math.round(ctx.calls) } };
+    }
+    const key = pool[0].fork.at;
+    if (key && pool[0].fork.loss >= ctx.thr && !pool.some(c => c.x === key.x && c.y === key.y) &&
+        isTransitionLegal(root, key.x, key.y)){
+      const base = pool[pool.length-1].adj;
+      const kc = { x: key.x, y: key.y, score: base, adj: base, keyPoint: true };
+      kc.fork = evalC(kc);
+      if (kc.fork) pool.push(kc);
+    }
+    let minF = Infinity;
+    for (const c of pool) if (c.fork.loss < minF) minF = c.fork.loss;
+    let best = pick, bestV = -Infinity;
+    for (const c of pool){
+      const extra = c.fork.loss - minF;
+      const v = c.adj - (extra >= ctx.thr - 1 ? SAFETY2_WEIGHT * extra : 0);
+      if (v > bestV){ bestV = v; best = c; }
+    }
+    return { pick: best, info: { calls: Math.round(ctx.calls), minLoss: minF,
+      losses: pool.map(c => ({ x: c.x, y: c.y, loss: c.fork.loss, key: !!c.keyPoint })) } };
+  }
+
+  function applySafety2(root, mover, diff, ordered, candidates, bestMove){
+    if (!diff.safety2 || !bestMove || candidates.length < 2) return { move: bestMove, info: null };
+    const opp = mover === 1 ? 2 : 1;
+    const top = candidates.slice().sort((a,b) => b.score - a.score).slice(0, diff.safety2Top || 8);
+    if (Math.abs(top[0].score) >= WIN_SCORE/2) return { move: bestMove, info: null };
+    let minRisk = Infinity;
+    for (const c of top){
+      const t = applyTransition(root, mover, c.x, c.y);
+      if (!t.ok){ c.risk = Infinity; continue; }
+      const mine = countCaptured(t.result.gained);
+      const th = (t.node.gameOver || t.node.current === mover) ? 0 : twoMoveThreat(t.node, opp);
+      c.risk = Math.max(0, th - mine);
+      if (c.risk < minRisk) minRisk = c.risk;
+    }
+    let pick = null, pickAdj = -Infinity;
+    for (const c of top){
+      if (!Number.isFinite(c.risk)){ c.adj = -Infinity; continue; }
+      const extra = c.risk - minRisk;
+      c.adj = c.score - (extra >= 2 ? SAFETY2_WEIGHT * extra : 0);
+      if (c.adj > pickAdj){ pickAdj = c.adj; pick = c; }
+    }
+    const info = { checked: top.length, minRisk, risks: top.map(c => ({ x: c.x, y: c.y, risk: c.risk })) };
+    if (diff.antiFork && pick){
+      const af = applyAntiFork(root, mover, diff, top, pick);
+      info.antiFork = af.info;
+      pick = af.pick;
+    }
+    if (!pick || (pick.x === bestMove.x && pick.y === bestMove.y)) return { move: bestMove, info };
+    const mv = ordered.find(o => o.x === pick.x && o.y === pick.y) || { x: pick.x, y: pick.y };
+    info.overridden = { from: { x: bestMove.x, y: bestMove.y }, to: { x: pick.x, y: pick.y } };
+    return { move: mv, info };
+  }
+
+  function searchMove(state, rows, cols, mover, diff, weights, opts){
+    opts = opts || {};
+    diff = diff || DIFFICULTY.normal;
+    weights = weights || BOT_WEIGHTS;
+    const nodeLimit = opts.nodeLimit;
+    const timeLimit = opts.timeLimit !== undefined ? opts.timeLimit
+      : (nodeLimit > 0 ? opts.emergencyTimeLimit : diff.timeLimit);
+    const sc = createSearchBudget({ clock: opts.clock, timeLimit, nodeLimit });
+    const trace = {
+      move: null, candidates: [], nodes: 0, completedDepth: 0, stopReason: null, elapsedMs: 0,
+      params: {
+        maxDepth: diff.maxDepth, candidateCap: diff.candidateCap, quiescenceExt: diff.quiescenceExt ?? 2,
+        timeLimit: Number.isFinite(sc.deadline) ? sc.deadline - sc.start : null,
+        nodeLimit: sc.nodeLimit || null
+      }
+    };
+    const finish = (move, reason) => {
+      trace.move = move ? { x: move.x, y: move.y } : null;
+      trace.nodes = sc.nodes;
+            trace.stopReason = reason;
+      // Точка проверки бюджета, на которой произошёл обрыв (или null).
+      trace.stopAt = sc.aborted ? (sc.stopAt || 'root') : null;
+      trace.elapsedMs = sc.clock() - sc.start;
+      return { move: move || null, trace };
+    };
+
+    const root = createSearchNode({
+      stone: state.stone, dead: state.dead, territory: state.territory, rows, cols,
+      current: mover, stonesPlacedTotal: opts.stonesPlacedTotal, gameOver: opts.gameOver, rules: opts.rules
+    });
+    if (root.gameOver) return finish(null, 'game-over');
+    const extInit = diff.quiescenceExt ?? 2;
+
+    // Бюджет проверяется и до дорогой генерации корневых кандидатов: при
+    // исчерпании — дешёвый легальный резервный ход (первый по y, затем x).
+    if (budgetExceeded(sc)){
+      trace.fallback = 'first-legal';
+      const f = firstLegalMove(root);
+      return finish(f, f ? sc.stopReason : 'no-legal-moves');
+    }
+
+        // A08: обязательные тактические ходы сохраняются до обрезки; стоимость
+    // генерации — в trace (genMs по реальным часам, не трогая управляемые).
+    const genStart = now();
+    const ordered = searchCandidates(root, diff, diff.candidateCap, sc);
+        // genMs — по реальным часам и потому недетерминирован: делаем поле
+    // неперечислимым, чтобы не ломать сравнение trace (детерминизм, worker).
+    Object.defineProperty(trace, 'genMs', { value: now() - genStart, enumerable: false, writable: true, configurable: true });
+    trace.tactical = ordered.filter(c => c.tactical).length;
+        trace.tacticalOverflow = sc.tacticalOverflow || 0;
+    // #81: внешний код (арбитр монитора) может подать ходы — например, спасение
+    // тревожной группы — в корень первыми кандидатами. Тогда поиск обязательно
+    // исследует их на полную глубину и сравнивает в одной шкале с остальными,
+    // вместо подмены хода после поиска по одноходовой статической оценке.
+    // Без opts.rootFirst поведение не меняется (детерминизм базы сохраняется).
+    if (Array.isArray(opts.rootFirst) && opts.rootFirst.length){
+      const injected = [];
+      for (let i = opts.rootFirst.length - 1; i >= 0; i--){
+        const m = opts.rootFirst[i];
+        if (!m || !Number.isInteger(m.x) || !Number.isInteger(m.y)) continue;
+        if (!isTransitionLegal(root, m.x, m.y)) continue;
+        const idx = ordered.findIndex(o => o.x === m.x && o.y === m.y);
+        const c = idx >= 0 ? ordered.splice(idx, 1)[0] : { x: m.x, y: m.y };
+        ordered.unshift(c);
+        injected.unshift({ x: m.x, y: m.y, wasCandidate: idx >= 0 });
+      }
+      if (injected.length) trace.rootFirst = injected;
+    }
+    if (!ordered.length){
+      trace.fallback = 'first-legal';
+      const f = firstLegalMove(root);
+      return finish(f, f ? 'no-candidates' : 'no-legal-moves');
+    }
+
+    // Перебор немедленных побед тоже под бюджетом: при исчерпании —
+    // первый кандидат по детерминированному порядку.
+    for (const c of ordered){
+      if (budgetExceeded(sc)){
+        trace.fallback = 'first-candidate';
+        return finish(ordered[0], sc.stopReason);
+      }
+      const t = applyTransition(root, mover, c.x, c.y);
+      if (t.ok && t.node.gameOver && t.node.winner === mover) return finish(c, 'immediate-win');
+    }
+
+    let bestMove = null;
+    for (let targetDepth = 2; targetDepth <= diff.maxDepth; targetDepth++){
+      if (budgetExceeded(sc)) break;
+      let localBest = null, localBestScore = -Infinity, alpha = -Infinity;
+      const scores = [];
+      for (const c of ordered){
+        if (budgetExceeded(sc)) break;
+        const t = applyTransition(root, mover, c.x, c.y);
+        if (!t.ok) continue;
+        const val = alphaBetaSearch(t.node, targetDepth-1, alpha, Infinity, diff, sc, mover, weights, extInit, 1);
+        if (sc.aborted) break;
+        // При отсечении score — граница, а не точная оценка.
+        scores.push({ x: c.x, y: c.y, score: val });
+        if (localBest === null || val > localBestScore){ localBestScore = val; localBest = c; }
+        alpha = Math.max(alpha, localBestScore);
+      }
+      if (sc.aborted || !localBest) break; // неполная итерация не принимается
+      bestMove = localBest;
+      trace.completedDepth = targetDepth;
+      trace.candidates = scores;
+      const idx = ordered.indexOf(bestMove);
+      if (idx > 0){ ordered.splice(idx, 1); ordered.unshift(bestMove); }
+    }
+    if (bestMove && trace.candidates.length > 1){
+      const s2 = applySafety2(root, mover, diff, ordered, trace.candidates, bestMove);
+      if (s2.info) trace.safety2 = s2.info;
+      bestMove = s2.move;
+    }
+    return finish(bestMove || ordered[0], sc.aborted ? sc.stopReason : 'max-depth');
+  }
+
+  // Совместимый интерфейс: возвращает только ход (или null).
+  function chooseMove(state, rows, cols, mover, diff, weights, ctx){
+    return searchMove(state, rows, cols, mover, diff, weights, ctx).move;
+  }
+
+
+  function isBoardFull(state, rows, cols){
+    for (let y=0;y<rows;y++)
+      for (let x=0;x<cols;x++)
+        if (state.stone[y][x]===0 && state.territory[y][x]===0) return false;
+    return true;
+  }
+
+  function countFilledCells(state, rows, cols){
+    let n = 0;
+    for (let y=0;y<rows;y++)
+      for (let x=0;x<cols;x++)
+        if (state.stone[y][x]!==0 || state.territory[y][x]!==0) n++;
+    return n;
+  }
+
+  function checkEndConditions(ctx){
+    const { state, rows, cols, scores, scoreRuleActive, targetScore, fillRuleActive, targetFillPercent, totalCells } = ctx;
+    if (isBoardFull(state, rows, cols)) return true;
+    if (scoreRuleActive && (scores[1] >= targetScore || scores[2] >= targetScore)) return true;
+    if (fillRuleActive){
+      const targetCells = Math.ceil(totalCells * targetFillPercent / 100);
+      if (countFilledCells(state, rows, cols) >= targetCells) return true;
+    }
+    return false;
+  }
+
+  // ---------- Партия целиком: инкапсулированное состояние одной игры ----------
+  // Это то, что нужно серверу: можно создать много независимых createMatch()
+  // (по одной на комнату), и они не будут делить между собой никакие
+  // module-level переменные — в отличие от однопользовательской версии.
+  function createRawMatch(options){
+    options = options || {};
+    const sizeKey = options.sizeKey && SIZES[options.sizeKey] ? options.sizeKey : 'medium';
+    const size = SIZES[sizeKey];
+    const rows = size.rows, cols = size.cols;
+    const state = createEmptyState(rows, cols);
+
+    // firstPlayer — кто ставит первую точку партии. По умолчанию 1 (в
+    // серверной модели это всегда создатель комнаты — см. server.js,
+    // где seat 1 закрепляется за создателем), но при создании комнаты
+    // это можно явно передать 2, чтобы первым ходил соперник/бот.
+    const firstPlayer = options.firstPlayer === 2 ? 2 : 1;
+    let current = firstPlayer;
+    // extraTurnOnCapture — доп. ход за окружение: если true, игрок,
+    // чей ход только что привёл к захвату (окружению) точки/точек
+    // соперника, ходит ещё раз вместо передачи хода сопернику.
+    const extraTurnOnCapture = options.extraTurnOnCapture === true;
+    // undoAllowed — разрешена ли в этой партии отмена хода вообще; решает
+    // создатель комнаты при её создании (по умолчанию true — как и было
+    // раньше, отмена доступна всем). Если false, canUndoLastMove() всегда
+    // возвращает false независимо от истории ходов, т.е. кнопка отмены и
+    // весь протокол request-undo/undo-approve/undo-decline для этой партии
+    // просто не активируются — ни для людей, ни (см. server.js) для бота.
+    const undoAllowed = options.undoAllowed !== false;
+    const scores = {1:0, 2:0};
+    // Последний ход каждого игрока — отдельно от общего moveLog, чтобы не
+    // пересчитывать его на каждый снимок: нужен именно "последняя точка
+    // игрока 1" и "последняя точка игрока 2" одновременно (а не только
+    // самый последний ход партии в целом), чтобы клиент мог подсветить
+    // обе точки — свою и соперника.
+    const lastMoveByPlayer = { 1: null, 2: null };
+    let gameOver = false;
+    let stonesPlacedTotal = 0;
+    const moveLog = [];
+    const totalCells = rows*cols;
+
+    // startPosition — стартовая позиция партии (issue #47):
+    //   'empty' (по умолчанию) — пустое поле, как было всегда;
+    //   'cross' — в центре поля заранее стоят четыре точки крестом:
+    //       верхний ряд: игрок 1, игрок 2
+    //       нижний ряд:  игрок 2, игрок 1
+    // Стартовые точки не являются ходами: их нет в moveLog/history, поэтому
+    // отменить их нельзя. Они учитываются в stonesPlacedTotal, поэтому
+    // ограничение дебютной зоны (первые 2 точки партии) для такой партии
+    // уже выполнено — первые точки уже стоят в центре.
+    const startPosition = options.startPosition === 'cross' ? 'cross' : 'empty';
+    const startStones = getStartStones(startPosition, rows, cols);
+    for (const s of startStones){
+      state.stone[s.y][s.x] = s.p;
+      stonesPlacedTotal++;
+    }
+
+    // Стек снимков "состояние прямо перед ходом N" — по одному на каждый
+    // применённый ход, в порядке ходов. Понадобился для отмены хода
+    // (шаг 14): захват мутирует сразу три слоя (stone/dead/territory) плюс
+    // очки, аналитически "развернуть" runCaptures надёжно не получится —
+    // проще и надёжнее просто вернуть весь снимок целиком. Память не
+    // проблема: даже на большом поле (19×15) один снимок — это три
+    // массива по 285 чисел, а ходов за партию не больше totalCells.
+    // Сейчас используется только последний элемент (отмена одного, самого
+    // последнего хода — так решили сознательно, см. обсуждение в чате);
+    // остальной стек хранится на будущее, если позже понадобится отмена
+    // на несколько ходов назад.
+    const history = [];
+
+    const targetScore = Math.max(0, Math.min(9999, Math.floor(options.targetScore) || 0));
+    let targetFillPercent = options.targetFillPercent;
+    if (typeof targetFillPercent !== 'number' || isNaN(targetFillPercent)) targetFillPercent = 100;
+    targetFillPercent = Math.max(0, Math.min(100, Math.floor(targetFillPercent)));
+    const scoreRuleActive = targetScore > 0;
+    const fillRuleActive = targetFillPercent > 0 && targetFillPercent < 100;
+
+    function snapshotForHistory(){
+      return {
+        state: cloneState(state),
+        scores: {...scores},
+        current,
+        stonesPlacedTotal,
+        lastMoveByPlayer: {
+          1: lastMoveByPlayer[1] ? {...lastMoveByPlayer[1]} : null,
+          2: lastMoveByPlayer[2] ? {...lastMoveByPlayer[2]} : null
+        }
+      };
+    }
+
+    const matchRules = { targetScore, targetFillPercent, scoreRuleActive, fillRuleActive, extraTurnOnCapture };
+
+    // Лёгкий узел перехода поверх ЖИВОГО состояния матча (без копирования
+    // доски): applyMove выполняет ход тем же applyTransitionInPlace, что и
+    // поиск бота/self-play, и затем забирает обратно очередь, счёт и т.д.
+    function liveNode(){
+      return { state, rows, cols, scores: { 1: scores[1], 2: scores[2] }, current,
+        stonesPlacedTotal, gameOver, winner: null, rules: matchRules };
+    }
+
+    function isLegal(x, y){
+      return transitionRejectReason(liveNode(), current, x, y) === null;
+    }
+
+    // Самоубийство обрабатывается общим captureSuicideRegion внутри
+    // applyTransitionInPlace (см. выше, «Единый лёгкий переход»).
+
+    // Выполняет ход player-а. Возвращает {ok:true, ...} при успехе или
+    // {ok:false, reason} при недопустимом ходе — второе не мутирует состояние.
+    function applyMove(player, x, y){
+      if (gameOver) return { ok:false, reason:'game-over' };
+      if (player !== current) return { ok:false, reason:'not-your-turn' };
+      if (!isLegal(x, y)) return { ok:false, reason:'illegal-cell' };
+
+      history.push(snapshotForHistory());
+
+      // Тот же переход, что у поиска бота и self-play (см. applyTransitionInPlace).
+      const node = liveNode();
+      const res = applyTransitionInPlace(node, player, x, y);
+      if (!res.ok){ history.pop(); return res; } // защитно: isLegal уже проверен
+      stonesPlacedTotal = node.stonesPlacedTotal;
+      current = node.current;
+      scores[1] = node.scores[1];
+      scores[2] = node.scores[2];
+      gameOver = node.gameOver;
+      const logEntry = {x, y, p: player, gained: res.gained.length};
+      if (res.suicide.length) logEntry.suicide = true;
+      moveLog.push(logEntry);
+      lastMoveByPlayer[player] = {x, y};
+      return res;
+    }
+
+    // Досрочное завершение (аналог кнопки «Закончить игру»).
+    function endNow(){
+      if (gameOver) return { ok:false, reason:'game-over' };
+      gameOver = true;
+      const winner = scores[1] > scores[2] ? 1 : (scores[2] > scores[1] ? 2 : 0);
+      return { ok:true, gameOver, winner, scores: {...scores} };
+    }
+
+    // Кто сделал самый последний ход партии (тот, чей ход в принципе можно
+    // отменить прямо сейчас) — null, если ходов ещё не было.
+    function lastMoverSeat(){
+      return moveLog.length ? moveLog[moveLog.length - 1].p : null;
+    }
+
+    // Можно ли сейчас отменить последний ход: партия не окончена и хотя бы
+    // один ход уже сделан. Сама проверка "тот ли игрок просит" и получение
+    // согласия соперника — забота вызывающего кода (см. server.js), движок
+    // отвечает только за то, ЧТО значит "отменить" применительно к доске.
+    function canUndoLastMove(){
+      return undoAllowed && !gameOver && history.length > 0;
+    }
+
+    // Отменяет ровно последний применённый ход, откатывая доску, счёт,
+    // очередь хода и счётчик точек к снимку, снятому непосредственно перед
+    // этим ходом (см. history/snapshotForHistory выше). Полный откат, а не
+    // точечная отмена одной точки — единственный надёжный способ учитывая,
+    // что ход мог вызвать захват (сразу три слоя состояния + очки).
+    function undoLastMove(){
+      if (!undoAllowed) return { ok:false, reason:'undo-disabled' };
+      if (!canUndoLastMove()) return { ok:false, reason: gameOver ? 'game-over' : 'nothing-to-undo' };
+      const prev = history.pop();
+      state.stone = prev.state.stone;
+      state.dead = prev.state.dead;
+      state.territory = prev.state.territory;
+      scores[1] = prev.scores[1];
+      scores[2] = prev.scores[2];
+      current = prev.current;
+      stonesPlacedTotal = prev.stonesPlacedTotal;
+      lastMoveByPlayer[1] = prev.lastMoveByPlayer[1];
+      lastMoveByPlayer[2] = prev.lastMoveByPlayer[2];
+      moveLog.pop();
+      return { ok:true, current, scores: {...scores}, stonesPlacedTotal };
+    }
+
+    // Поиск с диагностикой: { move, trace }. searchOpts — { nodeLimit,
+    // timeLimit, emergencyTimeLimit, clock } (см. searchMove).
+    function botSearch(difficultyKey, weights, searchOpts){
+      const diff = DIFFICULTY[difficultyKey] || DIFFICULTY.normal;
+      // Полные правила матча: пороги очков/заполнения, доп. ход, дебютная
+      // зона по stonesPlacedTotal, конец партии.
+      return searchMove(state, rows, cols, current, diff, weights || BOT_WEIGHTS,
+        Object.assign({}, searchOpts || {}, { stonesPlacedTotal, gameOver, rules: matchRules }));
+    }
+
+    // Совместимый интерфейс: только ход {x,y} или null. Необязательный
+    // searchOpts.onTrace(trace) получает диагностику без смены возврата.
+    function botMove(difficultyKey, weights, searchOpts){
+      const r = botSearch(difficultyKey, weights, searchOpts);
+      if (searchOpts && typeof searchOpts.onTrace === 'function') searchOpts.onTrace(r.trace);
+      return r.move;
+    }
+
+    // Полный снимок состояния — то, что уходит клиенту по WebSocket.
+    function getSnapshot(){
+      return {
+        sizeKey, rows, cols,
+        stone: state.stone.map(r => r.slice()),
+        dead: state.dead.map(r => r.slice()),
+        territory: state.territory.map(r => r.slice()),
+        current, scores: {...scores}, gameOver, stonesPlacedTotal,
+        openingZone: getOpeningZone(rows, cols),
+        lastMoveByPlayer: {
+          1: lastMoveByPlayer[1] ? {...lastMoveByPlayer[1]} : null,
+          2: lastMoveByPlayer[2] ? {...lastMoveByPlayer[2]} : null
+        },
+        lastMoverSeat: lastMoverSeat(),
+        canUndo: canUndoLastMove(),
+        rules: { targetScore, targetFillPercent, scoreRuleActive, fillRuleActive, totalCells, extraTurnOnCapture, firstPlayer, undoAllowed, startPosition }
+      };
+    }
+
+    function getMoveLog(){ return moveLog.slice(); }
+
+    return { rows, cols, sizeKey, applyMove, endNow, botMove, botSearch, getSnapshot, getMoveLog, undoLastMove, canUndoLastMove, lastMoverSeat };
+  }
+
+  // Replay identity describes rule semantics, not the npm package version.
+  const ENGINE_VERSION = 'tochki-rules-1';
+    // tochki-ab-2 (#62, S8): safety2:true в DIFFICULTY.strong.
+  const BOT_VERSION = 'tochki-ab-2';
+  const WEIGHTS_VERSION = 'tochki-weights-1';
+
+  // Record successful transitions at the shared engine boundary so server,
+  // CLI and offline callers cannot silently lose undo/end events.
+  function createMatch(options){
+    const match = createRawMatch(options);
+    const initial = match.getSnapshot();
+    const events = [];
+    const copy = value => JSON.parse(JSON.stringify(value));
+    const metadata = copy((options && options.replayMetadata) || {
+      botVersion: BOT_VERSION, weightsVersion: WEIGHTS_VERSION,
+      seed: null, budgets: null, weights: null
+    });
+    const apply = match.applyMove;
+    const undo = match.undoLastMove;
+    const end = match.endNow;
+    const terminal = reason => {
+      const s = match.getSnapshot();
+      events.push({ type: 'end', reason, winner: s.scores[1] > s.scores[2] ? 1 : s.scores[2] > s.scores[1] ? 2 : 0,
+        scores: s.scores });
+    };
+    match.applyMove = (player, x, y, decision) => {
+      // Clone before mutation: even invalid metadata must not partially apply.
+      const recordedDecision = decision === undefined ? undefined : copy(decision);
+      const result = apply(player, x, y);
+      if (result.ok){
+        const event = { type: 'move', player, x, y };
+        if (recordedDecision !== undefined) event.decision = recordedDecision;
+        events.push(event);
+        if (result.gameOver) terminal('rule');
+      }
+      return result;
+    };
+    match.undoLastMove = () => {
+      const result = undo();
+      if (result.ok) events.push({ type: 'undo' });
+      return result;
+    };
+    match.endNow = (reason = 'manual') => {
+      if (reason !== 'manual' && reason !== 'abandoned') return { ok: false, reason: 'invalid-end-reason' };
+      const result = end();
+      if (result.ok) terminal(reason);
+      return result;
+    };
+    match.getReplay = () => copy({
+      format: 'tochki-replay', version: 1, engineVersion: ENGINE_VERSION,
+      board: { sizeKey: initial.sizeKey, rows: initial.rows, cols: initial.cols },
+      rules: initial.rules, metadata, events
+    });
+    return match;
+  }
+
+  return {
+    ENGINE_VERSION, BOT_VERSION, WEIGHTS_VERSION,
+    SIZES, DIFFICULTY, TRAIN_DIFF, BOT_PLAYER, BOT_WEIGHTS,
+    OPENING_ZONE_SIDE, getOpeningZone, inZone, START_POSITIONS, getStartStones,
+    createEmptyState, cloneState, cellOwner, isWall, runCaptures,
+    generateCandidates, tacticalCandidates, strategicCandidates, searchCandidates, legalCandidates, quickScore, computeTerritoryPotential, computeEdgeEscape, evaluateStatic,
+    computeGroupLiberties, libertyRisk, computeUrgentCells, hasUrgentAtari,
+    chooseMove, searchMove, createSearchBudget, isBoardFull, countFilledCells, checkEndConditions,
+    normalizeRules, createSearchNode, cloneSearchNode, applyTransition, applyTransitionInPlace,
+    isTransitionLegal, terminalValue, WIN_SCORE, twoMoveThreat,
+    createMatch
+  };
+});
